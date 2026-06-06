@@ -39,7 +39,9 @@ function runBridge(command, args = []) {
       if (error) {
         console.error(`Python Exec error: ${error.message}`);
         console.error(`Stderr: ${stderr}`);
-        return reject(new Error(stderr || error.message));
+        console.error(`Stdout: ${stdout}`);
+        console.error(`Exit code: ${error.code} | Signal: ${error.signal}`);
+        return reject(new Error(stderr || stdout || error.message));
       }
       try {
         const json = JSON.parse(stdout.trim());
