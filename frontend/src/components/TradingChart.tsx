@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, LineStyle, UTCTimestamp } from 'lightweight-charts';
 import { getWsUrl } from '../config';
 import { Box, Select, MenuItem, Typography, CircularProgress } from '@mui/material';
@@ -51,6 +51,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
   onInfoChange,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const ema21Ref = useRef<ISeriesApi<'Line'> | null>(null);
@@ -60,16 +61,20 @@ export const TradingChart: React.FC<TradingChartProps> = ({
   const planLineRefs = useRef<any[]>([]);
   const lastBarTimeRef = useRef<number>(0);
   const planLevelsRef = useRef<PlanLevels | null>(null);
+  const symbolRef = useRef<string>(defaultSymbol);
 
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [interval, setInterval] = useState(defaultInterval);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Keep ref in sync with prop to avoid stale closures
+  // Keep refs in sync
   useEffect(() => {
     planLevelsRef.current = planLevels ?? null;
   });
+  useEffect(() => {
+    symbolRef.current = symbol;
+  }, [symbol]);
 
   useEffect(() => {
     onInfoChange?.(symbol, interval);
@@ -80,6 +85,105 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       setSymbol(forcedSymbol);
     }
   }, [forcedSymbol]);
+
+  // Draw colored zones on the canvas overlay (TradingView long/short setup style)
+  const drawPlanZones = useCallback(() => {
+    const canvas = overlayCanvasRef.current;
+    const container = containerRef.current;
+    const chart = chartRef.current;
+    const series = candSeriesRef.current;
+    if (!canvas || !container || !chart || !series) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    canvas.width = w;
+    canvas.height = h;
+    ctx.clearRect(0, 0, w, h);
+
+    const plan = planLevelsRef.current;
+    if (!plan || plan.symbol !== symbolRef.current) return;
+
+    // Right price scale width — plot area ends here
+    const priceScaleWidth = chart.priceScale('right').width();
+    const plotRight = w - priceScaleWidth;
+
+    // Start rectangles at the last candle's X position
+    let rectX = 0;
+    if (lastBarTimeRef.current > 0) {
+      const coord = chart.timeScale().timeToCoordinate(lastBarTimeRef.current as UTCTimestamp);
+      if (coord !== null && coord > 0) rectX = coord;
+    }
+
+    const rectW = plotRight - rectX;
+    if (rectW <= 2) return;
+
+    // Y coordinates for each price level
+    const yEntryMin = series.priceToCoordinate(plan.entry_min);
+    const yEntryMax = series.priceToCoordinate(plan.entry_max);
+    const ySL = series.priceToCoordinate(plan.stop_loss);
+    const yTP1 = plan.targets[0] != null ? series.priceToCoordinate(plan.targets[0]) : null;
+
+    if (yEntryMin === null || yEntryMax === null || ySL === null) return;
+
+    const isLong = plan.direction.toUpperCase() === 'LONG';
+
+    // Entry zone midpoint for zone boundary
+    const yEntry = (yEntryMin + yEntryMax) / 2;
+
+    // ── Risk zone: entry → SL ──────────────────────────────────────────────
+    const riskTop = Math.min(yEntry, ySL);
+    const riskBottom = Math.max(yEntry, ySL);
+    ctx.fillStyle = isLong
+      ? 'rgba(244, 63, 94, 0.14)'   // red for LONG risk (below entry)
+      : 'rgba(244, 63, 94, 0.14)';  // red for SHORT risk (above entry)
+    ctx.fillRect(rectX, riskTop, rectW, riskBottom - riskTop);
+
+    // ── Reward zone: entry → TP1 ───────────────────────────────────────────
+    if (yTP1 !== null) {
+      const rewardTop = Math.min(yEntry, yTP1);
+      const rewardBottom = Math.max(yEntry, yTP1);
+      ctx.fillStyle = isLong
+        ? 'rgba(16, 185, 129, 0.12)'   // green for LONG reward (above entry)
+        : 'rgba(16, 185, 129, 0.12)';  // green for SHORT reward (below entry)
+      ctx.fillRect(rectX, rewardTop, rectW, rewardBottom - rewardTop);
+    }
+
+    // ── Entry zone band (entry_min ↔ entry_max) ────────────────────────────
+    const entryZoneTop = Math.min(yEntryMin, yEntryMax);
+    const entryZoneH = Math.abs(yEntryMax - yEntryMin);
+    if (entryZoneH > 1) {
+      ctx.fillStyle = 'rgba(251, 191, 36, 0.18)';
+      ctx.fillRect(rectX, entryZoneTop, rectW, entryZoneH);
+    }
+
+    // ── Boundary line at entry midpoint ────────────────────────────────────
+    ctx.save();
+    ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(rectX, yEntry);
+    ctx.lineTo(plotRight, yEntry);
+    ctx.stroke();
+    ctx.restore();
+
+    // ── Left edge accent line ──────────────────────────────────────────────
+    const accentColor = isLong ? 'rgba(16, 185, 129, 0.7)' : 'rgba(244, 63, 94, 0.7)';
+    const zoneTop = yTP1 !== null ? Math.min(yEntry, yTP1, ySL) : Math.min(yEntry, ySL);
+    const zoneBottom = yTP1 !== null ? Math.max(yEntry, yTP1, ySL) : Math.max(yEntry, ySL);
+    ctx.save();
+    ctx.strokeStyle = accentColor;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(rectX, zoneTop);
+    ctx.lineTo(rectX, zoneBottom);
+    ctx.stroke();
+    ctx.restore();
+  }, []);
 
   const applyPlanMarkers = (plan: PlanLevels, sym: string) => {
     if (!candSeriesRef.current || plan.symbol !== sym || lastBarTimeRef.current === 0) return;
@@ -93,7 +197,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     }]);
   };
 
-  // Draw plan price lines and entry marker
+  // Draw plan price lines, entry marker, and canvas zones
   useEffect(() => {
     const series = candSeriesRef.current;
 
@@ -102,6 +206,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     });
     planLineRefs.current = [];
     series?.setMarkers([]);
+    drawPlanZones(); // clears canvas if no plan
 
     if (!series || !planLevels || planLevels.symbol !== symbol) return;
 
@@ -147,6 +252,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
 
     planLineRefs.current = lines;
     applyPlanMarkers(planLevels, symbol);
+    drawPlanZones();
   }, [planLevels, symbol]);
 
   const fetchKlines = async (sym: string, tf: string) => {
@@ -187,9 +293,12 @@ export const TradingChart: React.FC<TradingChartProps> = ({
 
       chartRef.current?.timeScale().fitContent();
 
-      // Re-apply markers after new data loads
       const plan = planLevelsRef.current;
-      if (plan) applyPlanMarkers(plan, sym);
+      if (plan) {
+        applyPlanMarkers(plan, sym);
+        // Small delay so the chart has rendered before we read coordinates
+        requestAnimationFrame(drawPlanZones);
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -197,7 +306,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     }
   };
 
-  // Init / re-init chart when symbol or interval changes
+  // Init / re-init chart
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -242,16 +351,23 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     ema50Ref.current = ema50;
     ema200Ref.current = ema200;
 
+    // Redraw zones when chart scrolls or zooms
+    chart.timeScale().subscribeVisibleLogicalRangeChange(drawPlanZones);
+
     const resizeObserver = new ResizeObserver((entries) => {
       if (!entries[0]?.contentRect) return;
       const { width, height } = entries[0].contentRect;
-      if (width > 0 && height > 0) chart.resize(width, height);
+      if (width > 0 && height > 0) {
+        chart.resize(width, height);
+        requestAnimationFrame(drawPlanZones);
+      }
     });
     resizeObserver.observe(containerRef.current);
 
     fetchKlines(symbol, interval);
 
     return () => {
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(drawPlanZones);
       resizeObserver.disconnect();
       planLineRefs.current = [];
       chart.remove();
@@ -291,8 +407,8 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     };
   }, [symbol, interval]);
 
-  // Compute plan overlay data
-  const planOverlay = (() => {
+  // Summary card data
+  const planCard = (() => {
     if (!planLevels || planLevels.symbol !== symbol) return null;
     const isLong = planLevels.direction.toUpperCase() === 'LONG';
     const entryMid = (planLevels.entry_min + planLevels.entry_max) / 2;
@@ -392,14 +508,29 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         </Box>
       </Box>
 
-      {/* Chart canvas */}
+      {/* Chart canvas area */}
       <Box sx={{ flexGrow: 1, position: 'relative', minHeight: 0 }}>
+        {/* lightweight-charts renders into this div */}
         <Box ref={containerRef} sx={{ width: '100%', height: '100%' }} />
+
+        {/* Canvas overlay for colored zones — sits on top, no pointer events */}
+        <canvas
+          ref={overlayCanvasRef}
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            pointerEvents: 'none',
+            zIndex: 1,
+          }}
+        />
 
         {loading && (
           <Box sx={{
             position: 'absolute', inset: 0, display: 'flex', justifyContent: 'center', alignItems: 'center',
-            background: 'rgba(11,15,25,0.6)', zIndex: 2, backdropFilter: 'blur(2px)',
+            background: 'rgba(11,15,25,0.6)', zIndex: 3, backdropFilter: 'blur(2px)',
           }}>
             <CircularProgress size={28} sx={{ color: 'var(--primary-color)' }} />
           </Box>
@@ -408,85 +539,72 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         {error && (
           <Box sx={{
             position: 'absolute', inset: 0, display: 'flex', justifyContent: 'center', alignItems: 'center',
-            p: 2, textAlign: 'center', color: '#ef4444', background: 'rgba(11,15,25,0.8)', zIndex: 2,
+            p: 2, textAlign: 'center', color: '#ef4444', background: 'rgba(11,15,25,0.8)', zIndex: 3,
           }}>
             <Typography variant="body2">{error}</Typography>
           </Box>
         )}
 
-        {/* TradingView-style plan overlay */}
-        {planOverlay && planLevels && (
+        {/* Summary card (top-left) */}
+        {planCard && planLevels && (
           <Box
             sx={{
               position: 'absolute',
               top: 10,
               left: 10,
-              zIndex: 5,
-              background: 'rgba(9, 13, 22, 0.92)',
-              backdropFilter: 'blur(12px)',
-              border: `1px solid ${planOverlay.isLong ? 'rgba(16,185,129,0.45)' : 'rgba(244,63,94,0.45)'}`,
-              borderLeft: `3px solid ${planOverlay.isLong ? '#10b981' : '#f43f5e'}`,
-              borderRadius: '0 10px 10px 0',
-              p: 1.5,
-              minWidth: '175px',
-              boxShadow: `0 6px 24px ${planOverlay.isLong ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)'}`,
+              zIndex: 4,
+              background: 'rgba(9,13,22,0.88)',
+              backdropFilter: 'blur(10px)',
+              border: `1px solid ${planCard.isLong ? 'rgba(16,185,129,0.4)' : 'rgba(244,63,94,0.4)'}`,
+              borderLeft: `3px solid ${planCard.isLong ? '#10b981' : '#f43f5e'}`,
+              borderRadius: '0 8px 8px 0',
+              p: 1.25,
+              minWidth: '168px',
+              boxShadow: `0 4px 20px rgba(0,0,0,0.3)`,
             }}
           >
-            {/* Direction badge + symbol */}
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 1.25 }}>
               <Box sx={{
-                background: planOverlay.isLong ? '#10b981' : '#f43f5e',
-                color: '#fff',
-                px: 1.5, py: '3px',
-                borderRadius: '5px',
-                fontSize: '0.78rem',
-                fontWeight: 800,
-                fontFamily: 'Outfit, sans-serif',
-                letterSpacing: '0.5px',
-                lineHeight: 1.3,
+                background: planCard.isLong ? '#10b981' : '#f43f5e',
+                color: '#fff', px: 1.25, py: '2px',
+                borderRadius: '4px', fontSize: '0.76rem', fontWeight: 800,
+                fontFamily: 'Outfit, sans-serif', letterSpacing: '0.5px',
               }}>
-                {planOverlay.isLong ? '▲ LONG' : '▼ SHORT'}
+                {planCard.isLong ? '▲ LONG' : '▼ SHORT'}
               </Box>
-              <Typography sx={{ fontSize: '0.74rem', color: 'rgba(255,255,255,0.85)', fontWeight: 600 }}>
+              <Typography sx={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.8)', fontWeight: 600 }}>
                 {planLevels.symbol.replace('USDT', '/USDT')}
               </Typography>
             </Box>
 
-            {/* Price levels */}
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-                <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Вход</Typography>
-                <Typography sx={{ fontSize: '0.71rem', color: '#fbbf24', fontFamily: 'monospace', fontWeight: 600 }}>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1.5 }}>
+                <Typography sx={{ fontSize: '0.67rem', color: 'var(--text-secondary)' }}>Вход</Typography>
+                <Typography sx={{ fontSize: '0.69rem', color: '#fbbf24', fontFamily: 'monospace', fontWeight: 600 }}>
                   {planLevels.entry_min} – {planLevels.entry_max}
                 </Typography>
               </Box>
-
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-                <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Stop Loss</Typography>
-                <Typography sx={{ fontSize: '0.71rem', color: '#f43f5e', fontFamily: 'monospace', fontWeight: 700 }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1.5 }}>
+                <Typography sx={{ fontSize: '0.67rem', color: 'var(--text-secondary)' }}>SL</Typography>
+                <Typography sx={{ fontSize: '0.69rem', color: '#f43f5e', fontFamily: 'monospace', fontWeight: 700 }}>
                   {planLevels.stop_loss}
                 </Typography>
               </Box>
-
               {planLevels.targets.map((tp, i) => (
-                <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-                  <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>TP{i + 1}</Typography>
-                  <Typography sx={{ fontSize: '0.71rem', color: '#10b981', fontFamily: 'monospace' }}>
-                    {tp}
-                  </Typography>
+                <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', gap: 1.5 }}>
+                  <Typography sx={{ fontSize: '0.67rem', color: 'var(--text-secondary)' }}>TP{i + 1}</Typography>
+                  <Typography sx={{ fontSize: '0.69rem', color: '#10b981', fontFamily: 'monospace' }}>{tp}</Typography>
                 </Box>
               ))}
             </Box>
 
-            {/* R:R row */}
             <Box sx={{
-              mt: 1.5, pt: 1,
-              borderTop: '1px solid rgba(255,255,255,0.07)',
+              mt: 1.25, pt: 1, borderTop: '1px solid rgba(255,255,255,0.07)',
               display: 'flex', justifyContent: 'space-between', alignItems: 'center',
             }}>
-              <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Risk / Reward</Typography>
-              <Typography sx={{ fontSize: '0.82rem', fontWeight: 800, fontFamily: 'Outfit, sans-serif', color: planOverlay.rrColor }}>
-                1:{planOverlay.rr}
+              <Typography sx={{ fontSize: '0.67rem', color: 'var(--text-secondary)' }}>R/R</Typography>
+              <Typography sx={{ fontSize: '0.8rem', fontWeight: 800, fontFamily: 'Outfit, sans-serif', color: planCard.rrColor }}>
+                1:{planCard.rr}
               </Typography>
             </Box>
           </Box>
