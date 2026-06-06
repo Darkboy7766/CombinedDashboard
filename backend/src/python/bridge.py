@@ -43,6 +43,38 @@ def cmd_snapshot(symbol):
             serializable[k] = v
     return serializable
 
+def cmd_generate_plan_stdin(symbol, plans_dir="plans"):
+    import json
+    import pandas as pd
+    from src.agent import TradingAgent
+
+    snapshot = json.loads(sys.stdin.read())
+
+    def to_df(records):
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        if 'timestamp' in df.columns:
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+
+    snapshot['ohlcv_1d'] = to_df(snapshot.get('ohlcv_1d', []))
+    snapshot['ohlcv_4h'] = to_df(snapshot.get('ohlcv_4h', []))
+    snapshot['ohlcv_1h'] = to_df(snapshot.get('ohlcv_1h', []))
+
+    agent = TradingAgent(plans_dir=plans_dir)
+    prompt = agent.generate_prompt_content(snapshot)
+    ai_response = agent.generate_plan_via_api(prompt)
+    if not ai_response:
+        return {"error": "Неуспешна комуникация с Gemini API."}
+
+    config, clean_report = agent.parse_ai_response_for_json(ai_response)
+    if not config:
+        return {"error": "Отговорът от AI не съдържаше валиден JSON блок.", "raw_response": ai_response}
+
+    md_path, json_path = agent.save_plan(symbol, config, clean_report)
+    return {"success": True, "symbol": symbol, "config": config, "report": clean_report, "md_path": md_path, "json_path": json_path}
+
 def cmd_generate_plan(symbol, plans_dir="plans"):
     from src.data_fetcher import DataFetcher
     from src.agent import TradingAgent
@@ -112,6 +144,12 @@ def main():
             symbol = sys.argv[2]
             plans_dir = sys.argv[3] if len(sys.argv) > 3 else "plans"
             res = cmd_generate_plan(symbol, plans_dir)
+            print(json.dumps(res, ensure_ascii=False))
+
+        elif cmd == "generate-plan-stdin":
+            symbol = sys.argv[2]
+            plans_dir = sys.argv[3] if len(sys.argv) > 3 else "plans"
+            res = cmd_generate_plan_stdin(symbol, plans_dir)
             print(json.dumps(res, ensure_ascii=False))
 
         else:

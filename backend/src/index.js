@@ -152,14 +152,13 @@ app.get('/api/snapshot/:symbol', async (req, res) => {
   }
 });
 
-// Generate Trading Plan using Gemini API
+// Generate Trading Plan using Gemini API — snapshot comes from browser
 app.post('/api/plans/generate', async (req, res) => {
-  const { symbol } = req.body;
-  if (!symbol) {
-    return res.status(400).json({ error: 'Symbol is required' });
-  }
+  const { symbol, snapshot } = req.body;
+  if (!symbol) return res.status(400).json({ error: 'Symbol is required' });
+  if (!snapshot) return res.status(400).json({ error: 'snapshot is required' });
   try {
-    const result = await runBridge('generate-plan', [symbol, plansDir]);
+    const result = await runBridgeWithStdin('generate-plan-stdin', [symbol, plansDir], JSON.stringify(snapshot));
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
