@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { API_BASE } from '../config';
 import { fetchMarketSnapshot } from '../utils/market';
+
+const BINANCE_FAPI = 'https://fapi.binance.com';
 import {
   Box,
   Tabs,
