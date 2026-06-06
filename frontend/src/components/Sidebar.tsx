@@ -67,6 +67,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
   // Active Plans state
   const [plans, setPlans] = useState<Plan[]>([]);
   const [plansLoading, setPlansLoading] = useState(false);
+  const [plansError, setPlansError] = useState<string | null>(null);
+  const [waking, setWaking] = useState(false);
   const [monitoredStatuses, setMonitoredStatuses] = useState<{ [id: string]: MonitorStatus }>({});
   const [monitoringLoading, setMonitoringLoading] = useState<{ [id: string]: boolean }>({});
 
@@ -118,21 +120,45 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
   // 2. Fetch all saved plans
   const fetchPlans = async () => {
     setPlansLoading(true);
+    setPlansError(null);
     try {
       const response = await fetch(`${API_BASE}/api/plans`);
-      if (!response.ok) throw new Error('Failed to fetch plans');
+      if (!response.ok) throw new Error(`Сървърна грешка: ${response.status}`);
       const data = await response.json();
       setPlans(data);
-      
+
       // Auto-trigger monitoring for each plan
       data.forEach((plan: Plan) => {
         monitorPlan(plan.id);
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load plans', err);
+      setPlansError('Сървърът не отговаря (Render е заспал).');
     } finally {
       setPlansLoading(false);
     }
+  };
+
+  // 2b. Wake up Render backend by polling /api/health
+  const wakeBackend = async () => {
+    setWaking(true);
+    setPlansError(null);
+    const maxAttempts = 20;
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          setWaking(false);
+          fetchPlans();
+          return;
+        }
+      } catch {
+        // still sleeping — keep polling
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    setWaking(false);
+    setPlansError('Сървърът не успя да се събуди. Опитай пак.');
   };
 
   // 3. Monitor a specific plan
@@ -449,6 +475,27 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
             {plansLoading ? (
               <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}>
                 <CircularProgress size={30} sx={{ color: 'var(--primary-color)' }} />
+              </Box>
+            ) : waking ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', py: 6, gap: 2 }}>
+                <CircularProgress size={30} sx={{ color: 'var(--primary-color)' }} />
+                <Typography variant="body2" sx={{ color: 'var(--text-secondary)', textAlign: 'center' }}>
+                  Събуждане на сървъра... (до ~60 сек.)
+                </Typography>
+              </Box>
+            ) : plansError ? (
+              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', py: 6, gap: 2 }}>
+                <Typography variant="body2" sx={{ color: '#f43f5e', textAlign: 'center' }}>
+                  ⚠ {plansError}
+                </Typography>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  onClick={wakeBackend}
+                  sx={{ color: 'var(--primary-color)', borderColor: 'var(--primary-color)', textTransform: 'none' }}
+                >
+                  Събуди сървъра
+                </Button>
               </Box>
             ) : plans.length === 0 ? (
               <Typography variant="body2" sx={{ textAlign: 'center', py: 6, color: 'var(--text-secondary)' }}>
