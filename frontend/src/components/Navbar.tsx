@@ -34,37 +34,32 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const fetchMacroStats = async () => {
     setLoading(true);
+    const safe = (p: Promise<Response>) => p.then(r => r.json()).catch(() => null);
     try {
-      // Fetching market snapshot for macro variables
-      const response = await fetch('/api/snapshot/BTCUSDT');
-      if (!response.ok) throw new Error('Failed to fetch snapshot');
-      const data = await response.json();
-      
-      const fearGreed = data.sentiment?.fear_and_greed_value ?? 50;
-      const fearGreedClass = data.sentiment?.fear_and_greed_classification ?? 'Neutral';
-      const btcDominance = data.macro?.btc_dominance ?? 54.5;
-      const totalMcapVal = data.macro?.total_market_cap_usd ?? 2.3e12;
-      const mcapChange = data.macro?.market_cap_change_24h_pct ?? 0.0;
-      
-      const totalMcap = (totalMcapVal / 1e12).toFixed(2) + 'T';
+      const [fng, gecko] = await Promise.all([
+        safe(fetch('https://api.alternative.me/fng/')),
+        safe(fetch('https://api.coingecko.com/api/v3/global')),
+      ]);
+
+      const fearGreed = fng?.data?.[0] ? +fng.data[0].value : null;
+      const fearGreedClass = fng?.data?.[0]?.value_classification ?? null;
+      const md = gecko?.data ?? null;
+      const btcDominance = md?.market_cap_percentage?.btc ?? null;
+      const totalMcapVal = md?.total_market_cap?.usd ?? null;
+      const mcapChange = md?.market_cap_change_percentage_24h_usd ?? null;
+
+      if (fearGreed === null && btcDominance === null) throw new Error('No data');
 
       setMacroStats({
-        fearGreed,
-        fearGreedClass,
-        btcDominance,
-        totalMcap,
-        mcapChange
+        fearGreed: fearGreed ?? 50,
+        fearGreedClass: fearGreedClass ?? 'Neutral',
+        btcDominance: btcDominance != null ? +btcDominance.toFixed(1) : 0,
+        totalMcap: totalMcapVal != null ? (totalMcapVal / 1e12).toFixed(2) + 'T' : 'N/A',
+        mcapChange: mcapChange != null ? +mcapChange.toFixed(2) : 0,
       });
     } catch (err) {
       console.error('Failed to load macro stats in navbar', err);
-      // Fallback
-      setMacroStats({
-        fearGreed: 52,
-        fearGreedClass: 'Neutral',
-        btcDominance: 54.2,
-        totalMcap: '2.35T',
-        mcapChange: 1.2
-      });
+      setMacroStats(null);
     } finally {
       setLoading(false);
     }
