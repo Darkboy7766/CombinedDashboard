@@ -1,25 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { createChart, IChartApi, ISeriesApi, LineStyle } from 'lightweight-charts';
+import { createChart, IChartApi, ISeriesApi, LineStyle, UTCTimestamp } from 'lightweight-charts';
 import { getWsUrl } from '../config';
+import { Box, Select, MenuItem, Typography, CircularProgress } from '@mui/material';
 
 const BINANCE_FAPI = 'https://fapi.binance.com';
 
-function calcEMA(closes: number[], timestamps: number[], period: number): { time: number; value: number }[] {
+function calcEMA(closes: number[], timestamps: number[], period: number): { time: UTCTimestamp; value: number }[] {
   if (closes.length < period) return [];
   const k = 2 / (period + 1);
   let sum = 0;
   for (let i = 0; i < period; i++) sum += closes[i];
   let prev = sum / period;
-  const result: { time: number; value: number }[] = [{ time: timestamps[period - 1] / 1000, value: prev }];
+  const result: { time: UTCTimestamp; value: number }[] = [{ time: (timestamps[period - 1] / 1000) as UTCTimestamp, value: prev }];
   for (let i = period; i < closes.length; i++) {
     prev = closes[i] * k + prev * (1 - k);
-    result.push({ time: timestamps[i] / 1000, value: prev });
+    result.push({ time: (timestamps[i] / 1000) as UTCTimestamp, value: prev });
   }
   return result;
 }
-import { Box, Select, MenuItem, Typography, IconButton, CircularProgress } from '@mui/material';
-import DeleteIcon from '@mui/icons-material/Delete';
-import VisibilityIcon from '@mui/icons-material/Visibility';
 
 export interface PlanLevels {
   symbol: string;
@@ -31,27 +29,26 @@ export interface PlanLevels {
 }
 
 interface TradingChartProps {
-  id: string;
-  isActive: boolean;
-  onSelect: () => void;
-  onRemove?: () => void;
-  defaultSymbol: string;
-  defaultInterval: string;
-  onActiveInfoChange: (symbol: string, interval: string) => void;
-  forcedSymbol?: string;
+  defaultSymbol?: string;
+  defaultInterval?: string;
   planLevels?: PlanLevels | null;
+  forcedSymbol?: string;
+  onInfoChange?: (symbol: string, interval: string) => void;
 }
 
+const SYMBOLS = [
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT',
+  'DOGEUSDT','AVAXUSDT','LINKUSDT','DOTUSDT','MATICUSDT','UNIUSDT',
+  'ATOMUSDT','LTCUSDT','NEARUSDT','APTUSDT','ARBUSDT','OPUSDT',
+  'SUIUSDT','PEPEUSDT','ZECUSDT',
+];
+
 export const TradingChart: React.FC<TradingChartProps> = ({
-  id,
-  isActive,
-  onSelect,
-  onRemove,
-  defaultSymbol,
-  defaultInterval,
-  onActiveInfoChange,
+  defaultSymbol = 'BTCUSDT',
+  defaultInterval = '1h',
+  planLevels,
   forcedSymbol,
-  planLevels
+  onInfoChange,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -61,35 +58,50 @@ export const TradingChart: React.FC<TradingChartProps> = ({
   const ema200Ref = useRef<ISeriesApi<'Line'> | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const planLineRefs = useRef<any[]>([]);
+  const lastBarTimeRef = useRef<number>(0);
+  const planLevelsRef = useRef<PlanLevels | null>(null);
 
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [interval, setInterval] = useState(defaultInterval);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Sync active chart parameters to parent
+  // Keep ref in sync with prop to avoid stale closures
   useEffect(() => {
-    if (isActive) {
-      onActiveInfoChange(symbol, interval);
-    }
-  }, [isActive, symbol, interval]);
+    planLevelsRef.current = planLevels ?? null;
+  });
 
-  // Force symbol change when a plan is activated from Sidebar
+  useEffect(() => {
+    onInfoChange?.(symbol, interval);
+  }, [symbol, interval]);
+
   useEffect(() => {
     if (forcedSymbol && forcedSymbol !== symbol) {
       setSymbol(forcedSymbol);
     }
   }, [forcedSymbol]);
 
-  // Draw/redraw plan level lines (Entry, TP, SL) on the chart
+  const applyPlanMarkers = (plan: PlanLevels, sym: string) => {
+    if (!candSeriesRef.current || plan.symbol !== sym || lastBarTimeRef.current === 0) return;
+    const isLong = plan.direction.toUpperCase() === 'LONG';
+    candSeriesRef.current.setMarkers([{
+      time: lastBarTimeRef.current as UTCTimestamp,
+      position: isLong ? 'belowBar' : 'aboveBar',
+      color: isLong ? '#10b981' : '#f43f5e',
+      shape: isLong ? 'arrowUp' : 'arrowDown',
+      text: isLong ? 'LONG' : 'SHORT',
+    }]);
+  };
+
+  // Draw plan price lines and entry marker
   useEffect(() => {
     const series = candSeriesRef.current;
 
-    // Remove previous plan lines
     planLineRefs.current.forEach(line => {
       try { series?.removePriceLine(line); } catch {}
     });
     planLineRefs.current = [];
+    series?.setMarkers([]);
 
     if (!series || !planLevels || planLevels.symbol !== symbol) return;
 
@@ -101,7 +113,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
-      title: 'Вход мин',
+      title: 'Вход ↓',
     }));
 
     lines.push(series.createPriceLine({
@@ -110,7 +122,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
-      title: 'Вход макс',
+      title: 'Вход ↑',
     }));
 
     lines.push(series.createPriceLine({
@@ -134,15 +146,15 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     });
 
     planLineRefs.current = lines;
+    applyPlanMarkers(planLevels, symbol);
   }, [planLevels, symbol]);
 
-  // Fetch initial klines directly from Binance (bypasses backend — datacenter IPs are blocked)
-  const fetchKlines = async () => {
+  const fetchKlines = async (sym: string, tf: string) => {
     setLoading(true);
     setError(null);
     try {
       const response = await fetch(
-        `${BINANCE_FAPI}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=300`
+        `${BINANCE_FAPI}/fapi/v1/klines?symbol=${sym}&interval=${tf}&limit=300`
       );
       if (!response.ok) throw new Error(`Binance error: ${response.status}`);
       const raw: any[][] = await response.json();
@@ -158,12 +170,13 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       if (!candSeriesRef.current) return;
 
       candSeriesRef.current.setData(candles.map(c => ({
-        time: c.t / 1000,
-        open: c.o,
-        high: c.h,
-        low: c.l,
-        close: c.c,
+        time: (c.t / 1000) as UTCTimestamp,
+        open: c.o, high: c.h, low: c.l, close: c.c,
       })));
+
+      if (candles.length > 0) {
+        lastBarTimeRef.current = candles[candles.length - 1].t / 1000;
+      }
 
       const closes = candles.map(c => c.c);
       const timestamps = candles.map(c => c.t);
@@ -173,6 +186,10 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       if (ema200Ref.current) ema200Ref.current.setData(calcEMA(closes, timestamps, 200));
 
       chartRef.current?.timeScale().fitContent();
+
+      // Re-apply markers after new data loads
+      const plan = planLevelsRef.current;
+      if (plan) applyPlanMarkers(plan, sym);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -180,49 +197,44 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     }
   };
 
-  // Init chart
+  // Init / re-init chart when symbol or interval changes
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // Create chart API
     const chart = createChart(containerRef.current, {
       layout: {
         background: { color: 'rgba(17, 24, 39, 0.2)' },
         textColor: '#94a3b8',
-        fontFamily: 'Outfit, sans-serif'
+        fontFamily: 'Outfit, sans-serif',
       },
       grid: {
         vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
-        horzLines: { color: 'rgba(255, 255, 255, 0.04)' }
+        horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
       },
       crosshair: {
         mode: 0,
         vertLine: { color: '#6366f1', labelBackgroundColor: '#6366f1' },
-        horzLine: { color: '#6366f1', labelBackgroundColor: '#6366f1' }
+        horzLine: { color: '#6366f1', labelBackgroundColor: '#6366f1' },
       },
       timeScale: {
         borderColor: 'rgba(255, 255, 255, 0.08)',
         timeVisible: true,
-        secondsVisible: false
+        secondsVisible: false,
       },
-      rightPriceScale: {
-        borderColor: 'rgba(255, 255, 255, 0.08)'
-      }
+      rightPriceScale: { borderColor: 'rgba(255, 255, 255, 0.08)' },
     });
 
-    // Create candle series
     const candleSeries = chart.addCandlestickSeries({
       upColor: '#10b981',
       downColor: '#f43f5e',
       borderVisible: false,
       wickUpColor: '#10b981',
-      wickDownColor: '#f43f5e'
+      wickDownColor: '#f43f5e',
     });
 
-    // Create EMA line series
-    const ema21 = chart.addLineSeries({ color: '#ffb703', lineWidth: 1.5, title: 'EMA 21' });
-    const ema50 = chart.addLineSeries({ color: '#06b6d4', lineWidth: 1.5, title: 'EMA 50' });
-    const ema200 = chart.addLineSeries({ color: '#d946ef', lineWidth: 1.5, title: 'EMA 200' });
+    const ema21 = chart.addLineSeries({ color: '#ffb703', lineWidth: 1, title: 'EMA 21' });
+    const ema50 = chart.addLineSeries({ color: '#06b6d4', lineWidth: 1, title: 'EMA 50' });
+    const ema200 = chart.addLineSeries({ color: '#d946ef', lineWidth: 2, title: 'EMA 200' });
 
     chartRef.current = chart;
     candSeriesRef.current = candleSeries;
@@ -230,15 +242,14 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     ema50Ref.current = ema50;
     ema200Ref.current = ema200;
 
-    // Handle resizing
     const resizeObserver = new ResizeObserver((entries) => {
-      if (entries.length === 0 || !entries[0].contentRect) return;
+      if (!entries[0]?.contentRect) return;
       const { width, height } = entries[0].contentRect;
-      chart.resize(width, height);
+      if (width > 0 && height > 0) chart.resize(width, height);
     });
     resizeObserver.observe(containerRef.current);
 
-    fetchKlines();
+    fetchKlines(symbol, interval);
 
     return () => {
       resizeObserver.disconnect();
@@ -248,45 +259,29 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     };
   }, [symbol, interval]);
 
-  // Handle WebSockets (live price stream)
+  // WebSocket live price stream
   useEffect(() => {
     const socket = new WebSocket(getWsUrl());
     socketRef.current = socket;
 
-    socket.onopen = () => {
-      console.log(`WebSocket client subscribed to ${symbol} @ ${interval}`);
-      socket.send(JSON.stringify({ symbol, interval }));
-    };
+    socket.onopen = () => socket.send(JSON.stringify({ symbol, interval }));
 
     socket.onmessage = (event) => {
       try {
         const tick = JSON.parse(event.data);
-        if (tick.error) {
-          console.error(tick.error);
-          return;
-        }
-
-        if (candSeriesRef.current && tick.t) {
+        if (tick.error || !tick.t) return;
+        if (candSeriesRef.current) {
           candSeriesRef.current.update({
-            time: tick.t / 1000,
-            open: tick.o,
-            high: tick.h,
-            low: tick.l,
-            close: tick.c
+            time: (tick.t / 1000) as UTCTimestamp,
+            open: tick.o, high: tick.h, low: tick.l, close: tick.c,
           });
+          lastBarTimeRef.current = tick.t / 1000;
         }
-      } catch (err) {
-        console.error('Failed to parse WebSocket tick', err);
-      }
+      } catch {}
     };
 
-    socket.onerror = (err) => {
-      console.error('WebSocket connection error', err);
-    };
-
-    socket.onclose = () => {
-      console.log(`WebSocket closed for ${symbol}`);
-    };
+    socket.onerror = () => {};
+    socket.onclose = () => {};
 
     return () => {
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -296,33 +291,44 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     };
   }, [symbol, interval]);
 
-  const handleIntervalChange = (val: string) => {
-    setInterval(val);
-  };
+  // Compute plan overlay data
+  const planOverlay = (() => {
+    if (!planLevels || planLevels.symbol !== symbol) return null;
+    const isLong = planLevels.direction.toUpperCase() === 'LONG';
+    const entryMid = (planLevels.entry_min + planLevels.entry_max) / 2;
+    const risk = Math.abs(entryMid - planLevels.stop_loss);
+    const firstTarget = planLevels.targets[0];
+    const reward = firstTarget ? Math.abs(firstTarget - entryMid) : 0;
+    const rr = risk > 0 && reward > 0 ? (reward / risk).toFixed(1) : '-';
+    const rrNum = parseFloat(rr);
+    const rrColor = rrNum >= 2 ? '#10b981' : rrNum >= 1.5 ? '#fbbf24' : '#f43f5e';
+    return { isLong, rr, rrColor };
+  })();
 
   return (
     <Box
-      onClick={onSelect}
-      className={`glass-panel ${isActive ? 'active-chart-border' : ''}`}
+      className="glass-panel"
       sx={{
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
         position: 'relative',
-        cursor: 'pointer',
         overflow: 'hidden',
-        borderWidth: '1.5px'
+        borderWidth: '1.5px',
       }}
     >
-      {/* Chart Toolbar */}
+      {/* Toolbar */}
       <Box
         sx={{
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
-          p: 1.5,
+          px: { xs: 1, md: 1.5 },
+          py: 1,
           borderBottom: '1px solid var(--surface-border)',
-          background: 'rgba(15, 23, 42, 0.4)'
+          background: 'rgba(15, 23, 42, 0.4)',
+          flexWrap: 'wrap',
+          gap: 0.5,
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -333,136 +339,156 @@ export const TradingChart: React.FC<TradingChartProps> = ({
             sx={{
               height: '32px',
               color: '#fff',
-              background: 'rgba(255, 255, 255, 0.05)',
+              background: 'rgba(255,255,255,0.05)',
               fontFamily: 'Outfit, sans-serif',
               fontWeight: 600,
               fontSize: '0.85rem',
               '.MuiOutlinedInput-notchedOutline': { borderColor: 'var(--surface-border)' },
               '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--primary-color)' },
-              '.MuiSelect-icon': { color: 'var(--text-secondary)' }
+              '.MuiSelect-icon': { color: 'var(--text-secondary)' },
             }}
           >
-            {[
-              'BTCUSDT','ZECUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
-              'ADAUSDT','DOGEUSDT','AVAXUSDT','LINKUSDT','DOTUSDT',
-              'MATICUSDT','UNIUSDT','ATOMUSDT','LTCUSDT','NEARUSDT',
-              'APTUSDT','ARBUSDT','OPUSDT','SUIUSDT','PEPEUSDT'
-            ].map(s => (
+            {SYMBOLS.map(s => (
               <MenuItem key={s} value={s} sx={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.85rem' }}>
                 {s.replace('USDT', '/USDT')}
               </MenuItem>
             ))}
           </Select>
-          
+
           <Select
             value={interval}
-            onChange={(e) => handleIntervalChange(e.target.value)}
+            onChange={(e) => setInterval(e.target.value)}
             size="small"
             sx={{
               height: '32px',
               color: '#fff',
-              background: 'rgba(255, 255, 255, 0.05)',
+              background: 'rgba(255,255,255,0.05)',
               '.MuiOutlinedInput-notchedOutline': { borderColor: 'var(--surface-border)' },
               '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--primary-color)' },
               fontFamily: 'Outfit, sans-serif',
-              fontSize: '0.85rem'
+              fontSize: '0.85rem',
             }}
           >
-            <MenuItem value="1m">1m</MenuItem>
-            <MenuItem value="5m">5m</MenuItem>
-            <MenuItem value="15m">15m</MenuItem>
-            <MenuItem value="1h">1h</MenuItem>
-            <MenuItem value="4h">4h</MenuItem>
-            <MenuItem value="1d">1d</MenuItem>
+            {['1m','5m','15m','1h','4h','1d'].map(tf => (
+              <MenuItem key={tf} value={tf}>{tf}</MenuItem>
+            ))}
           </Select>
         </Box>
 
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-          {isActive && (
-            <Box
-              sx={{
-                background: 'var(--primary-color)',
-                color: '#fff',
-                fontSize: '0.7rem',
-                fontWeight: 600,
-                px: 1,
-                py: 0.5,
-                borderRadius: '4px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 0.5,
-                boxShadow: '0 0 8px var(--primary-glow)'
-              }}
-            >
-              <VisibilityIcon sx={{ fontSize: '0.9rem' }} />
-              АКТИВНА
+        {/* EMA legend */}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: { xs: 1, md: 1.5 }, opacity: 0.75 }}>
+          {[
+            { label: 'EMA 21', color: '#ffb703' },
+            { label: 'EMA 50', color: '#06b6d4' },
+            { label: 'EMA 200', color: '#d946ef' },
+          ].map(({ label, color }) => (
+            <Box key={label} sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Box sx={{ width: 14, height: 2, background: color, borderRadius: 1, flexShrink: 0 }} />
+              <Typography sx={{ fontSize: '0.68rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                {label}
+              </Typography>
             </Box>
-          )}
-
-          {onRemove && (
-            <IconButton
-              size="small"
-              onClick={(e) => {
-                e.stopPropagation();
-                onRemove();
-              }}
-              sx={{ color: '#ef4444', '&:hover': { background: 'rgba(239, 68, 68, 0.1)' } }}
-            >
-              <DeleteIcon sx={{ fontSize: '1.2rem' }} />
-            </IconButton>
-          )}
+          ))}
         </Box>
       </Box>
 
-      {/* Chart Canvas Area */}
-      <Box
-        ref={containerRef}
-        sx={{
-          flexGrow: 1,
-          width: '100%',
-          position: 'relative',
-          minHeight: '200px'
-        }}
-      >
+      {/* Chart canvas */}
+      <Box sx={{ flexGrow: 1, position: 'relative', minHeight: 0 }}>
+        <Box ref={containerRef} sx={{ width: '100%', height: '100%' }} />
+
         {loading && (
-          <Box
-            sx={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: '100%',
-              display: 'flex',
-              justifyContent: 'center',
-              alignItems: 'center',
-              background: 'rgba(11, 15, 25, 0.6)',
-              zIndex: 2,
-              backdropFilter: 'blur(2px)'
-            }}
-          >
-            <CircularProgress size={30} sx={{ color: 'var(--primary-color)' }} />
+          <Box sx={{
+            position: 'absolute', inset: 0, display: 'flex', justifyContent: 'center', alignItems: 'center',
+            background: 'rgba(11,15,25,0.6)', zIndex: 2, backdropFilter: 'blur(2px)',
+          }}>
+            <CircularProgress size={28} sx={{ color: 'var(--primary-color)' }} />
           </Box>
         )}
-        
+
         {error && (
+          <Box sx={{
+            position: 'absolute', inset: 0, display: 'flex', justifyContent: 'center', alignItems: 'center',
+            p: 2, textAlign: 'center', color: '#ef4444', background: 'rgba(11,15,25,0.8)', zIndex: 2,
+          }}>
+            <Typography variant="body2">{error}</Typography>
+          </Box>
+        )}
+
+        {/* TradingView-style plan overlay */}
+        {planOverlay && planLevels && (
           <Box
             sx={{
               position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: '100%',
-              display: 'flex',
-              justifyContent: 'center',
-              alignItems: 'center',
-              p: 2,
-              textAlign: 'center',
-              color: '#ef4444',
-              background: 'rgba(11, 15, 25, 0.8)',
-              zIndex: 2
+              top: 10,
+              left: 10,
+              zIndex: 5,
+              background: 'rgba(9, 13, 22, 0.92)',
+              backdropFilter: 'blur(12px)',
+              border: `1px solid ${planOverlay.isLong ? 'rgba(16,185,129,0.45)' : 'rgba(244,63,94,0.45)'}`,
+              borderLeft: `3px solid ${planOverlay.isLong ? '#10b981' : '#f43f5e'}`,
+              borderRadius: '0 10px 10px 0',
+              p: 1.5,
+              minWidth: '175px',
+              boxShadow: `0 6px 24px ${planOverlay.isLong ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)'}`,
             }}
           >
-            <Typography variant="body2">{error}</Typography>
+            {/* Direction badge + symbol */}
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+              <Box sx={{
+                background: planOverlay.isLong ? '#10b981' : '#f43f5e',
+                color: '#fff',
+                px: 1.5, py: '3px',
+                borderRadius: '5px',
+                fontSize: '0.78rem',
+                fontWeight: 800,
+                fontFamily: 'Outfit, sans-serif',
+                letterSpacing: '0.5px',
+                lineHeight: 1.3,
+              }}>
+                {planOverlay.isLong ? '▲ LONG' : '▼ SHORT'}
+              </Box>
+              <Typography sx={{ fontSize: '0.74rem', color: 'rgba(255,255,255,0.85)', fontWeight: 600 }}>
+                {planLevels.symbol.replace('USDT', '/USDT')}
+              </Typography>
+            </Box>
+
+            {/* Price levels */}
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
+                <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Вход</Typography>
+                <Typography sx={{ fontSize: '0.71rem', color: '#fbbf24', fontFamily: 'monospace', fontWeight: 600 }}>
+                  {planLevels.entry_min} – {planLevels.entry_max}
+                </Typography>
+              </Box>
+
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
+                <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Stop Loss</Typography>
+                <Typography sx={{ fontSize: '0.71rem', color: '#f43f5e', fontFamily: 'monospace', fontWeight: 700 }}>
+                  {planLevels.stop_loss}
+                </Typography>
+              </Box>
+
+              {planLevels.targets.map((tp, i) => (
+                <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
+                  <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>TP{i + 1}</Typography>
+                  <Typography sx={{ fontSize: '0.71rem', color: '#10b981', fontFamily: 'monospace' }}>
+                    {tp}
+                  </Typography>
+                </Box>
+              ))}
+            </Box>
+
+            {/* R:R row */}
+            <Box sx={{
+              mt: 1.5, pt: 1,
+              borderTop: '1px solid rgba(255,255,255,0.07)',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            }}>
+              <Typography sx={{ fontSize: '0.69rem', color: 'var(--text-secondary)' }}>Risk / Reward</Typography>
+              <Typography sx={{ fontSize: '0.82rem', fontWeight: 800, fontFamily: 'Outfit, sans-serif', color: planOverlay.rrColor }}>
+                1:{planOverlay.rr}
+              </Typography>
+            </Box>
           </Box>
         )}
       </Box>
