@@ -32,7 +32,8 @@ function runBridge(command, args = []) {
   return new Promise((resolve, reject) => {
     const pythonScript = path.join(__dirname, 'python', 'bridge.py');
     const escapedArgs = args.map(arg => `"${arg.toString().replace(/"/g, '\\"')}"`).join(' ');
-    const cmd = `python "${pythonScript}" ${command} ${escapedArgs}`;
+    const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+    const cmd = `${pythonBin} "${pythonScript}" ${command} ${escapedArgs}`;
     
     exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
       if (error) {
@@ -58,7 +59,8 @@ function runBridge(command, args = []) {
 function runMonitor(symbol) {
   return new Promise((resolve, reject) => {
     const pythonScript = path.join(__dirname, 'python', 'src', 'monitor.py');
-    const cmd = `python "${pythonScript}" "${symbol}" --json --plans-dir "${plansDir}"`;
+    const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+    const cmd = `${pythonBin} "${pythonScript}" "${symbol}" --json --plans-dir "${plansDir}"`;
     
     exec(cmd, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
       if (error) {
