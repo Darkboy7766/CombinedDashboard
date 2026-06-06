@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Box, IconButton, Tooltip, Snackbar, Alert } from '@mui/material';
 import { API_BASE } from './config';
+import { fetchMarketSnapshot } from './utils/market';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import { Navbar } from './components/Navbar';
@@ -128,20 +129,32 @@ const App: React.FC = () => {
 
   const handleExport = async () => {
     setSnackbarSeverity('info');
-    setSnackbarMessage('Генериране на данни за експорт...');
+    setSnackbarMessage('Събиране на пазарни данни...');
     setSnackbarOpen(true);
 
     try {
-      // Fetch snapshot data from backend
-      const response = await fetch(`${API_BASE}/api/snapshot/${activeSymbol}`);
-      if (!response.ok) throw new Error('Връзката с бекенда пропадна.');
-      const snapshot = await response.json();
+      // Fetch snapshot and klines for analysis in parallel
+      const [snapshot, klRes] = await Promise.all([
+        fetchMarketSnapshot(activeSymbol, API_BASE),
+        fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${activeSymbol}&interval=${activeInterval}&limit=300`)
+          .then(r => r.json()).catch(() => null),
+      ]);
 
-      // Fetch rule-based analysis
-      const analysisResponse = await fetch(`${API_BASE}/api/analysis/${activeSymbol}/${activeInterval}`);
-      const analysis = analysisResponse.ok ? await analysisResponse.json() : null;
+      // Run rule-based analysis via backend (POST with candles)
+      let analysis = null;
+      if (Array.isArray(klRes) && klRes.length > 0) {
+        const candles = klRes.map((d: any[]) => ({
+          t: d[0], o: parseFloat(d[1]), h: parseFloat(d[2]),
+          l: parseFloat(d[3]), c: parseFloat(d[4]), v: parseFloat(d[5]),
+        }));
+        const analysisRes = await fetch(`${API_BASE}/api/analysis/${activeSymbol}/${activeInterval}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ candles }),
+        });
+        if (analysisRes.ok) analysis = await analysisRes.json();
+      }
 
-      // Build structured payload for Claude
       const payload = {
         user_trading_profile: {
           account_capital_usd: 1000,
@@ -154,30 +167,27 @@ const App: React.FC = () => {
           symbol: activeSymbol,
           interval: activeInterval,
           fetched_at: new Date().toISOString(),
-          funding_rate: snapshot.funding_rate || null,
-          open_interest: snapshot.open_interest || null,
-          long_short_ratio: snapshot.long_short_ratio || null,
-          order_book: snapshot.order_book || null,
-          sentiment: snapshot.sentiment || null,
-          macro: snapshot.macro || null
+          funding_rate: snapshot.funding_rate,
+          open_interest: snapshot.open_interest,
+          long_short_ratio: snapshot.long_short_ratio,
+          order_book: snapshot.order_book,
+          sentiment: snapshot.sentiment,
+          macro: snapshot.macro,
         },
         historical_ohlcv_data: {
-          timeframe_4h_candles_count: snapshot.ohlcv_4h ? snapshot.ohlcv_4h.length : 0,
-          timeframe_1d_candles_count: snapshot.ohlcv_1d ? snapshot.ohlcv_1d.length : 0,
-          candles_4h: snapshot.ohlcv_4h || [],
-          candles_1d: snapshot.ohlcv_1d || []
+          timeframe_1h_candles_count: snapshot.ohlcv_1h.length,
+          timeframe_4h_candles_count: snapshot.ohlcv_4h.length,
+          timeframe_1d_candles_count: snapshot.ohlcv_1d.length,
+          candles_1h: snapshot.ohlcv_1h,
+          candles_4h: snapshot.ohlcv_4h,
+          candles_1d: snapshot.ohlcv_1d,
         },
-        analysis: analysis || {}
+        technical_analysis: analysis ?? {},
       };
 
-      // Convert to formatted JSON
-      const jsonText = JSON.stringify(payload, null, 2);
-
-      // Copy to clipboard
-      await navigator.clipboard.writeText(jsonText);
-
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
       setSnackbarSeverity('success');
-      setSnackbarMessage(`Успешно копиран JSON за ${activeSymbol}! Поставете го в Claude.`);
+      setSnackbarMessage(`Копиран JSON за ${activeSymbol} (${activeInterval})! Поставете го в Claude.`);
     } catch (err: any) {
       setSnackbarSeverity('error');
       setSnackbarMessage(`Грешка при експорт: ${err.message}`);
