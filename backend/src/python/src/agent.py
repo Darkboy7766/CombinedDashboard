@@ -17,7 +17,7 @@ class TradingAgent:
     def __init__(self, plans_dir: str = "plans"):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.default_mode = os.getenv("DEFAULT_MODE", "prompt").lower()
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         self.plans_dir = plans_dir
         
         # Създаване на директория за планове, ако не съществува
