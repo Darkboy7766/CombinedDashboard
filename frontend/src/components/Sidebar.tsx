@@ -24,7 +24,6 @@ import {
 import DeleteIcon from '@mui/icons-material/Delete';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
-import InfoIcon from '@mui/icons-material/Info';
 import CloseIcon from '@mui/icons-material/Close';
 import ShowChartIcon from '@mui/icons-material/ShowChart';
 import { PlanLevels } from './TradingChart';
@@ -73,7 +72,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
 
   // AI Plan Generator state
   const [generating, setGenerating] = useState(false);
-  const [generatedPlan, setGeneratedPlan] = useState<any>(null);
+  const [_generatedPlan, setGeneratedPlan] = useState<any>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
 
   // Markdown Modal state
