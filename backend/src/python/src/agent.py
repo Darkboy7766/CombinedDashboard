@@ -17,7 +17,7 @@ class TradingAgent:
     def __init__(self, plans_dir: str = "plans"):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.default_mode = os.getenv("DEFAULT_MODE", "prompt").lower()
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
         self.plans_dir = plans_dir
         
         # Създаване на директория за планове, ако не съществува
@@ -185,7 +185,8 @@ class TradingAgent:
             response = model.generate_content(prompt)
             return response.text
         except Exception as e:
-            print(f"[!] Грешка при комуникация с Gemini API: {e}")
+            import sys
+            sys.stderr.write(f"[!] Gemini API error: {e}\n")
             return None
 
     def parse_ai_response_for_json(self, text: str) -> Tuple[Optional[Dict[str, Any]], str]:
