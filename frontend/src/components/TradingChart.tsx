@@ -110,11 +110,14 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     const priceScaleWidth = chart.priceScale('right').width();
     const plotRight = w - priceScaleWidth;
 
-    // Start rectangles at the last candle's X position
+    // Start rectangles 5 bars to the right of the last candle
     let rectX = 0;
     if (lastBarTimeRef.current > 0) {
       const coord = chart.timeScale().timeToCoordinate(lastBarTimeRef.current as UTCTimestamp);
-      if (coord !== null && coord > 0) rectX = coord;
+      if (coord !== null && coord > 0) {
+        const barSpacing = chart.timeScale().options().barSpacing;
+        rectX = coord + 5 * barSpacing;
+      }
     }
 
     const rectW = plotRight - rectX;
@@ -292,6 +295,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
       if (ema200Ref.current) ema200Ref.current.setData(calcEMA(closes, timestamps, 200));
 
       chartRef.current?.timeScale().fitContent();
+      chartRef.current?.timeScale().applyOptions({ rightOffset: 20 });
 
       const plan = planLevelsRef.current;
       if (plan) {
@@ -329,6 +333,7 @@ export const TradingChart: React.FC<TradingChartProps> = ({
         borderColor: 'rgba(255, 255, 255, 0.08)',
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 20,
       },
       rightPriceScale: { borderColor: 'rgba(255, 255, 255, 0.08)' },
     });
