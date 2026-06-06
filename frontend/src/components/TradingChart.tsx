@@ -1,6 +1,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart, IChartApi, ISeriesApi, LineStyle } from 'lightweight-charts';
-import { API_BASE, getWsUrl } from '../config';
+import { getWsUrl } from '../config';
+
+const BINANCE_FAPI = 'https://fapi.binance.com';
+
+function calcEMA(closes: number[], timestamps: number[], period: number): { time: number; value: number }[] {
+  if (closes.length < period) return [];
+  const k = 2 / (period + 1);
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += closes[i];
+  let prev = sum / period;
+  const result: { time: number; value: number }[] = [{ time: timestamps[period - 1] / 1000, value: prev }];
+  for (let i = period; i < closes.length; i++) {
+    prev = closes[i] * k + prev * (1 - k);
+    result.push({ time: timestamps[i] / 1000, value: prev });
+  }
+  return result;
+}
 import { Box, Select, MenuItem, Typography, IconButton, CircularProgress } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import VisibilityIcon from '@mui/icons-material/Visibility';
@@ -120,46 +136,43 @@ export const TradingChart: React.FC<TradingChartProps> = ({
     planLineRefs.current = lines;
   }, [planLevels, symbol]);
 
-  // Fetch initial klines and draw chart
+  // Fetch initial klines directly from Binance (bypasses backend — datacenter IPs are blocked)
   const fetchKlines = async () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${API_BASE}/api/klines/${symbol}/${interval}?limit=300`);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch klines: ${response.statusText}`);
-      }
-      const data = await response.json();
-      
+      const response = await fetch(
+        `${BINANCE_FAPI}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=300`
+      );
+      if (!response.ok) throw new Error(`Binance error: ${response.status}`);
+      const raw: any[][] = await response.json();
+
+      const candles = raw.map(d => ({
+        t: d[0] as number,
+        o: parseFloat(d[1]),
+        h: parseFloat(d[2]),
+        l: parseFloat(d[3]),
+        c: parseFloat(d[4]),
+      }));
+
       if (!candSeriesRef.current) return;
 
-      // Transform data for lightweight-charts
-      const candles = data.candles.map((c: any) => ({
+      candSeriesRef.current.setData(candles.map(c => ({
         time: c.t / 1000,
         open: c.o,
         high: c.h,
         low: c.l,
-        close: c.c
-      }));
+        close: c.c,
+      })));
 
-      candSeriesRef.current.setData(candles);
+      const closes = candles.map(c => c.c);
+      const timestamps = candles.map(c => c.t);
 
-      // Set EMAs
-      if (data.emas) {
-        if (ema21Ref.current && data.emas.ema21) {
-          ema21Ref.current.setData(data.emas.ema21.map((e: any) => ({ time: e.t / 1000, value: e.v })));
-        }
-        if (ema50Ref.current && data.emas.ema50) {
-          ema50Ref.current.setData(data.emas.ema50.map((e: any) => ({ time: e.t / 1000, value: e.v })));
-        }
-        if (ema200Ref.current && data.emas.ema200) {
-          ema200Ref.current.setData(data.emas.ema200.map((e: any) => ({ time: e.t / 1000, value: e.v })));
-        }
-      }
+      if (ema21Ref.current) ema21Ref.current.setData(calcEMA(closes, timestamps, 21));
+      if (ema50Ref.current) ema50Ref.current.setData(calcEMA(closes, timestamps, 50));
+      if (ema200Ref.current) ema200Ref.current.setData(calcEMA(closes, timestamps, 200));
 
-      // Fit chart to content
       chartRef.current?.timeScale().fitContent();
-
     } catch (err: any) {
       setError(err.message);
     } finally {

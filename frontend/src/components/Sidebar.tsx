@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { API_BASE } from '../config';
+
+const BINANCE_FAPI = 'https://fapi.binance.com';
 import {
   Box,
   Tabs,
@@ -79,13 +81,30 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
   const [selectedPlanSymbol, setSelectedPlanSymbol] = useState<string>('');
   const [markdownLoading, setMarkdownLoading] = useState(false);
 
-  // 1. Fetch Technical Analysis
+  // 1. Fetch Technical Analysis — klines come from Binance directly (datacenter IPs are blocked)
   const fetchAnalysis = async () => {
     if (!activeSymbol || !activeInterval) return;
     setAnalysisLoading(true);
     setAnalysisError(null);
     try {
-      const response = await fetch(`${API_BASE}/api/analysis/${activeSymbol}/${activeInterval}`);
+      const klRes = await fetch(
+        `${BINANCE_FAPI}/fapi/v1/klines?symbol=${activeSymbol}&interval=${activeInterval}&limit=300`
+      );
+      if (!klRes.ok) throw new Error(`Binance error: ${klRes.status}`);
+      const raw: any[][] = await klRes.json();
+      const candles = raw.map(d => ({
+        t: d[0], o: parseFloat(d[1]), h: parseFloat(d[2]),
+        l: parseFloat(d[3]), c: parseFloat(d[4]), v: parseFloat(d[5]),
+      }));
+
+      const response = await fetch(
+        `${API_BASE}/api/analysis/${activeSymbol}/${activeInterval}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ candles }),
+        }
+      );
       if (!response.ok) throw new Error('Failed to fetch analysis');
       const data = await response.json();
       setAnalysisData(data);

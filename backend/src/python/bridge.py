@@ -21,6 +21,12 @@ def cmd_analysis(symbol, interval, limit=250):
     analysis = ae.analyse(candles, symbol, interval)
     return analysis
 
+def cmd_analysis_stdin(symbol, interval):
+    import json
+    import analysis_engine as ae
+    candles = json.loads(sys.stdin.read())
+    return ae.analyse(candles, symbol, interval)
+
 def cmd_snapshot(symbol):
     from src.data_fetcher import DataFetcher
     fetcher = DataFetcher()
@@ -89,6 +95,12 @@ def main():
             symbol = sys.argv[2]
             interval = sys.argv[3]
             res = cmd_analysis(symbol, interval)
+            print(json.dumps(res, ensure_ascii=False))
+
+        elif cmd == "analysis-stdin":
+            symbol = sys.argv[2]
+            interval = sys.argv[3]
+            res = cmd_analysis_stdin(symbol, interval)
             print(json.dumps(res, ensure_ascii=False))
 
         elif cmd == "snapshot":

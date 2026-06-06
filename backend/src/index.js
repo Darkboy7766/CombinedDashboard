@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -83,6 +83,32 @@ function runMonitor(symbol) {
   });
 }
 
+// --- Helper to pass large data to Python via stdin ---
+function runBridgeWithStdin(command, args, stdinData) {
+  return new Promise((resolve, reject) => {
+    const pythonScript = path.join(__dirname, 'python', 'bridge.py');
+    const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+    const child = spawn(pythonBin, [pythonScript, command, ...args]);
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error(stderr || stdout || `Exit ${code}`));
+      try {
+        const json = JSON.parse(stdout.trim());
+        if (json.error) return reject(new Error(json.error));
+        resolve(json);
+      } catch (e) {
+        reject(new Error(`Parse error: ${e.message}`));
+      }
+    });
+    child.stdin.write(stdinData);
+    child.stdin.end();
+  });
+}
+
 // --- REST Endpoints ---
 
 // Health Check
@@ -102,11 +128,13 @@ app.get('/api/klines/:symbol/:interval', async (req, res) => {
   }
 });
 
-// Fetch Technical Analysis
-app.get('/api/analysis/:symbol/:interval', async (req, res) => {
+// Fetch Technical Analysis — candles come from the browser (Binance blocks server IPs)
+app.post('/api/analysis/:symbol/:interval', async (req, res) => {
   const { symbol, interval } = req.params;
+  const { candles } = req.body;
+  if (!candles?.length) return res.status(400).json({ error: 'candles required' });
   try {
-    const data = await runBridge('analysis', [symbol, interval]);
+    const data = await runBridgeWithStdin('analysis-stdin', [symbol, interval], JSON.stringify(candles));
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
