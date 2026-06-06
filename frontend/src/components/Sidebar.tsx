@@ -64,8 +64,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
-  // Active Plans state
-  const [plans, setPlans] = useState<Plan[]>([]);
+  // Active Plans state — seeded from localStorage so plans survive Render restarts
+  const [plans, setPlans] = useState<Plan[]>(() => {
+    try { return JSON.parse(localStorage.getItem('trading_plans') ?? '[]'); } catch { return []; }
+  });
   const [plansLoading, setPlansLoading] = useState(false);
   const [plansError, setPlansError] = useState<string | null>(null);
   const [waking, setWaking] = useState(false);
@@ -117,18 +119,31 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
     }
   };
 
-  // 2. Fetch all saved plans
+  const savePlansToCache = (data: Plan[]) => {
+    try { localStorage.setItem('trading_plans', JSON.stringify(data)); } catch {}
+  };
+
+  // 2. Fetch all saved plans — merges server response with local cache
   const fetchPlans = async () => {
     setPlansLoading(true);
     setPlansError(null);
     try {
       const response = await fetch(`${API_BASE}/api/plans`);
       if (!response.ok) throw new Error(`Сървърна грешка: ${response.status}`);
-      const data = await response.json();
-      setPlans(data);
+      const serverData: Plan[] = await response.json();
 
-      // Auto-trigger monitoring for each plan
-      data.forEach((plan: Plan) => {
+      // Merge: use server data but fall back to cached entries the server lost
+      const cached: Plan[] = JSON.parse(localStorage.getItem('trading_plans') ?? '[]');
+      const serverIds = new Set(serverData.map(p => p.id));
+      const merged = [
+        ...serverData,
+        ...cached.filter(p => !serverIds.has(p.id)),
+      ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+      setPlans(merged);
+      savePlansToCache(merged);
+
+      merged.forEach((plan: Plan) => {
         monitorPlan(plan.id);
       });
     } catch (err: any) {
@@ -193,7 +208,22 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
       if (data.error) throw new Error(data.error);
       
       setGeneratedPlan(data);
-      // Refresh plans list to show the new plan
+
+      // Cache the new plan immediately so it survives Render restarts
+      const newPlan: Plan = {
+        id: data.symbol,
+        symbol: data.symbol,
+        created_at: new Date().toISOString(),
+        config: data.config,
+      };
+      setPlans(prev => {
+        const without = prev.filter(p => p.id !== newPlan.id);
+        const updated = [newPlan, ...without];
+        savePlansToCache(updated);
+        return updated;
+      });
+
+      // Also sync with server
       fetchPlans();
       // Switch tab to Plans
       setTabValue(1);
@@ -228,8 +258,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
       const response = await fetch(`${API_BASE}/api/plans/${id}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Failed to delete plan');
       
-      // Filter out plan locally
-      setPlans(prev => prev.filter(p => p.id !== id));
+      // Filter out plan locally and from cache
+      setPlans(prev => {
+        const updated = prev.filter(p => p.id !== id);
+        savePlansToCache(updated);
+        return updated;
+      });
       setMonitoredStatuses(prev => {
         const copy = { ...prev };
         delete copy[id];

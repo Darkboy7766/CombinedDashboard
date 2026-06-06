@@ -7,6 +7,7 @@ const WebSocket = require('ws');
 const { exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -14,13 +15,16 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Ensure plans folder exists (use /tmp on Linux/Render, local path on Windows dev)
+// Temp dir for monitor.py (needs a local JSON file to read plan config)
 const plansDir = process.platform === 'win32'
   ? path.join(__dirname, '..', 'plans')
   : '/tmp/plans';
 if (!fs.existsSync(plansDir)) {
   fs.mkdirSync(plansDir, { recursive: true });
 }
+
+// Supabase client (service role — bypasses RLS)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -185,6 +189,14 @@ app.post('/api/plans/generate', async (req, res) => {
   if (!snapshot) return res.status(400).json({ error: 'snapshot is required' });
   try {
     const result = await runBridgeWithStdin('generate-plan-stdin', [symbol, plansDir], JSON.stringify(snapshot));
+    const { error } = await supabase.from('plans').upsert({
+      id: result.symbol,
+      symbol: result.symbol,
+      created_at: new Date().toISOString(),
+      config: result.config,
+      markdown: result.report,
+    }, { onConflict: 'id' });
+    if (error) throw new Error(error.message);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -192,56 +204,52 @@ app.post('/api/plans/generate', async (req, res) => {
 });
 
 // List all active plans
-app.get('/api/plans', (req, res) => {
+app.get('/api/plans', async (req, res) => {
   try {
-    const files = fs.readdirSync(plansDir);
-    const plans = [];
-    
-    files.forEach(file => {
-      if (file.endsWith('_plan.json')) {
-        const filePath = path.join(plansDir, file);
-        try {
-          const content = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-          plans.push({
-            id: file.replace('_plan.json', ''),
-            symbol: content.symbol,
-            created_at: content.created_at,
-            config: content.config
-          });
-        } catch (e) {
-          console.error(`Failed to read plan file ${file}: ${e.message}`);
-        }
-      }
-    });
-    
-    // Sort plans by creation date (newest first)
-    plans.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    res.json(plans);
+    const { data, error } = await supabase
+      .from('plans')
+      .select('id, symbol, created_at, config')
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message);
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Get plan markdown report
-app.get('/api/plans/:symbol/markdown', (req, res) => {
+app.get('/api/plans/:symbol/markdown', async (req, res) => {
   const { symbol } = req.params;
-  const filePath = path.join(plansDir, `${symbol.toUpperCase()}_plan.md`);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: `Markdown report for ${symbol} not found.` });
-  }
   try {
-    const markdown = fs.readFileSync(filePath, 'utf-8');
-    res.json({ markdown });
+    const { data, error } = await supabase
+      .from('plans')
+      .select('markdown')
+      .eq('id', symbol.toUpperCase())
+      .single();
+    if (error || !data) return res.status(404).json({ error: `Plan for ${symbol} not found.` });
+    res.json({ markdown: data.markdown });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Monitor an active plan
+// Monitor an active plan — writes temp JSON so monitor.py can read plan config
 app.get('/api/plans/:symbol/monitor', async (req, res) => {
   const { symbol } = req.params;
+  const upperSymbol = symbol.toUpperCase();
   try {
-    const status = await runMonitor(symbol);
+    const { data } = await supabase
+      .from('plans')
+      .select('symbol, created_at, config')
+      .eq('id', upperSymbol)
+      .single();
+    if (data) {
+      fs.writeFileSync(
+        path.join(plansDir, `${upperSymbol}_plan.json`),
+        JSON.stringify({ symbol: data.symbol, created_at: data.created_at, config: data.config }, null, 2)
+      );
+    }
+    const status = await runMonitor(upperSymbol);
     res.json(status);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -249,27 +257,21 @@ app.get('/api/plans/:symbol/monitor', async (req, res) => {
 });
 
 // Delete an active plan
-app.delete('/api/plans/:symbol', (req, res) => {
+app.delete('/api/plans/:symbol', async (req, res) => {
   const { symbol } = req.params;
   const upperSymbol = symbol.toUpperCase();
-  const jsonPath = path.join(plansDir, `${upperSymbol}_plan.json`);
-  const mdPath = path.join(plansDir, `${upperSymbol}_plan.md`);
-  
-  let deleted = false;
   try {
-    if (fs.existsSync(jsonPath)) {
-      fs.unlinkSync(jsonPath);
-      deleted = true;
-    }
-    if (fs.existsSync(mdPath)) {
-      fs.unlinkSync(mdPath);
-      deleted = true;
-    }
-    if (deleted) {
-      res.json({ success: true, message: `Plan for ${upperSymbol} deleted successfully` });
-    } else {
-      res.status(404).json({ error: `No active plan found for ${upperSymbol}` });
-    }
+    const { error, count } = await supabase
+      .from('plans')
+      .delete({ count: 'exact' })
+      .eq('id', upperSymbol);
+    if (error) throw new Error(error.message);
+    ['.json', '.md'].forEach(ext => {
+      const p = path.join(plansDir, `${upperSymbol}_plan${ext}`);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    });
+    if (count === 0) return res.status(404).json({ error: `No plan found for ${upperSymbol}` });
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -367,6 +369,4 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
