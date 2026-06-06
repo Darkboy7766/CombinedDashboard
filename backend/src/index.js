@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const { exec, spawn } = require('child_process');
 const path = require('path');
@@ -109,7 +110,32 @@ function runBridgeWithStdin(command, args, stdinData) {
   });
 }
 
+// --- Helpers ---
+
+function proxyBinanceFutures(path, res) {
+  const url = `https://fapi.binance.com${path}`;
+  https.get(url, (bRes) => {
+    let data = '';
+    bRes.on('data', d => { data += d; });
+    bRes.on('end', () => {
+      try { res.json(JSON.parse(data)); }
+      catch { res.status(502).json({ error: 'Parse error from Binance' }); }
+    });
+  }).on('error', (e) => res.status(502).json({ error: e.message }));
+}
+
 // --- REST Endpoints ---
+
+// Proxy Binance statistics endpoints (blocked by CORS in browsers)
+app.get('/api/binance/openInterestHist', (req, res) => {
+  const qs = new URLSearchParams(req.query).toString();
+  proxyBinanceFutures(`/futures/data/openInterestHist?${qs}`, res);
+});
+
+app.get('/api/binance/globalLongShortAccountRatio', (req, res) => {
+  const qs = new URLSearchParams(req.query).toString();
+  proxyBinanceFutures(`/futures/data/globalLongShortAccountRatio?${qs}`, res);
+});
 
 // Health Check
 app.get('/api/health', (req, res) => {

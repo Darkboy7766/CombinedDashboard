@@ -13,8 +13,8 @@ async function fetchMarketSnapshot(symbol: string) {
     safe(fetch(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=1h&limit=200`)),
     safe(fetch(`${BINANCE_FAPI}/fapi/v1/premiumIndex?symbol=${norm}`)),
     safe(fetch(`${BINANCE_FAPI}/fapi/v1/openInterest?symbol=${norm}`)),
-    safe(fetch(`${BINANCE_FAPI}/data/openInterestHist?symbol=${norm}&period=1h&limit=2`)),
-    safe(fetch(`${BINANCE_FAPI}/data/globalLongShortAccountRatio?symbol=${norm}&period=1h&limit=1`)),
+    safe(fetch(`${API_BASE}/api/binance/openInterestHist?symbol=${norm}&period=1h&limit=2`)),
+    safe(fetch(`${API_BASE}/api/binance/globalLongShortAccountRatio?symbol=${norm}&period=1h&limit=1`)),
     safe(fetch(`${BINANCE_FAPI}/fapi/v1/depth?symbol=${norm}&limit=100`)),
     safe(fetch('https://api.alternative.me/fng/')),
     safe(fetch('https://api.coingecko.com/api/v3/global')),
@@ -204,7 +204,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeSymbol, activeInterval, 
   const fetchPlans = async () => {
     setPlansLoading(true);
     try {
-      const response = await fetch('/api/plans');
+      const response = await fetch(`${API_BASE}/api/plans`);
       if (!response.ok) throw new Error('Failed to fetch plans');
       const data = await response.json();
       setPlans(data);
