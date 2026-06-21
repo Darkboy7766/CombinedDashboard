@@ -8,6 +8,12 @@ environments those calls return {"error": ...} and the agent must fall back to
 a real OHLCV export (--csv mode) or mark the field unavailable — never an
 estimated or web-sourced number, and never fabricated.
 
+CHANGED 2026-06-21: rsi()/atr() now use Wilder/RMA smoothing (wilder_smooth)
+instead of a flat rolling SMA — matches TradingView/Binance values, which the
+old version did not. _indicators() also gained "ema200_reliable" and
+"macd_reliable" flags (true only once enough candles exist) and no longer
+collapses a legitimate 0.0 reading (e.g. macd_hist at a cross) into null.
+
 All commands print one JSON object to stdout.
 
 MATH (offline, always works):
@@ -86,13 +92,26 @@ def rolling_std(vals, period):  # sample std, ddof=1 (matches pandas .std())
     return out
 
 
+def wilder_smooth(vals, period):
+    # RMA / Wilder smoothing: seed with simple average of the first `period`
+    # values, then decay old values at alpha=1/period. Matches TradingView's
+    # RSI/ATR; a flat rolling SMA (the previous implementation) does not.
+    out = [None] * len(vals)
+    if len(vals) < period:
+        return out
+    out[period - 1] = sum(vals[:period]) / period
+    for i in range(period, len(vals)):
+        out[i] = (out[i - 1] * (period - 1) + vals[i]) / period
+    return out
+
+
 def rsi(closes, period=14):
     gains, losses = [0.0], [0.0]
     for i in range(1, len(closes)):
         d = closes[i] - closes[i - 1]
         gains.append(d if d > 0 else 0.0)
         losses.append(-d if d < 0 else 0.0)
-    avg_g, avg_l = sma(gains, period), sma(losses, period)
+    avg_g, avg_l = wilder_smooth(gains, period), wilder_smooth(losses, period)
     out = []
     for g, l in zip(avg_g, avg_l):
         if g is None or l is None:
@@ -110,7 +129,7 @@ def atr(highs, lows, closes, period=14):
         tr.append(max(highs[i] - lows[i],
                       abs(highs[i] - closes[i - 1]),
                       abs(lows[i] - closes[i - 1])))
-    return sma(tr, period)
+    return wilder_smooth(tr, period)
 
 
 def macd(closes, fast=12, slow=26, signal=9):
@@ -223,17 +242,20 @@ def _indicators(rows, interval="?"):
         "interval": interval, "close": last,
         "ema20": e20[i], "ema50": e50[i], "ema200": e200[i],
         "rsi14": r14[i], "atr14": a14[i],
-        "atr_pct_of_price": round(a14[i] / last * 100, 2) if a14[i] else None,
+        "atr_pct_of_price": round(a14[i] / last * 100, 2) if a14[i] is not None else None,
         "macd": ml[i], "macd_signal": msig[i], "macd_hist": mh[i],
         "bb_upper": bb_u, "bb_mid": bb_mid[i], "bb_lower": bb_l,
-        "trend_above_ema200": (last > e200[i]) if e200[i] else None,
-        "ema_alignment_bullish": bool(e20[i] > e50[i] > e200[i]) if e200[i] else None,
-        "ema_alignment_bearish": bool(e20[i] < e50[i] < e200[i]) if e200[i] else None,
+        "trend_above_ema200": (last > e200[i]) if e200[i] is not None else None,
+        "ema_alignment_bullish": bool(e20[i] > e50[i] > e200[i]) if e200[i] is not None else None,
+        "ema_alignment_bearish": bool(e20[i] < e50[i] < e200[i]) if e200[i] is not None else None,
         "rsi_overbought": (r14[i] > 70) if r14[i] is not None else None,
         "rsi_oversold": (r14[i] < 30) if r14[i] is not None else None,
         "macd_bullish_cross": bool(mh[i] > 0 and mh[i - 1] <= 0),
         "macd_bearish_cross": bool(mh[i] < 0 and mh[i - 1] >= 0),
-        "candles_used": len(rows), "fetched_at": now_iso(),
+        "candles_used": len(rows),
+        "ema200_reliable": len(rows) >= 200,
+        "macd_reliable": len(rows) >= 35,
+        "fetched_at": now_iso(),
     }
 
 
