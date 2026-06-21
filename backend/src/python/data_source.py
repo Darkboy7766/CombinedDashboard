@@ -1,5 +1,6 @@
 """
-data_source.py — pluggable market data adapter (currently: Binance Spot/Futures).
+data_source.py — pluggable market data adapter (currently: Binance Spot/Futures,
+falling back to Bybit on Binance errors — e.g. rate limits, region blocks).
 
 To add a broker, implement get_klines() and make_stream_url() for it and
 swap the active functions at the bottom of this file.  One function each —
@@ -9,6 +10,8 @@ Candle dict schema: {t: int (ms), o: float, h: float, l: float, c: float, v: flo
 """
 import json
 import urllib.request
+
+import bybit_source
 
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUT  = "https://fapi.binance.com"
@@ -55,8 +58,14 @@ def _binance_stream_url(symbol: str, interval: str) -> str:
 # ---------- Active adapter (swap to change broker) ----------
 
 def get_klines(symbol: str, interval: str, limit: int = 250, futures: bool = False) -> list[dict]:
-    """Fetch historical OHLCV candles. Returns list of candle dicts."""
-    return _binance_klines(symbol, interval, limit, futures)
+    """Fetch historical OHLCV candles. Returns list of candle dicts.
+
+    Falls back to Bybit if Binance errors (rate limit, region block, timeout).
+    """
+    try:
+        return _binance_klines(symbol, interval, limit, futures)
+    except Exception:
+        return bybit_source.get_klines(symbol, interval, limit, futures)
 
 
 def make_stream_url(symbol: str, interval: str) -> str:

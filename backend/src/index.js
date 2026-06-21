@@ -116,30 +116,68 @@ function runBridgeWithStdin(command, args, stdinData) {
 
 // --- Helpers ---
 
-function proxyBinanceFutures(path, res) {
-  const url = `https://fapi.binance.com${path}`;
-  https.get(url, (bRes) => {
-    let data = '';
-    bRes.on('data', d => { data += d; });
-    bRes.on('end', () => {
-      try { res.json(JSON.parse(data)); }
-      catch { res.status(502).json({ error: 'Parse error from Binance' }); }
-    });
-  }).on('error', (e) => res.status(502).json({ error: e.message }));
+// Fetches a URL and resolves with the parsed JSON body, or rejects on
+// network error, non-2xx status (incl. 429/418 rate-limit), or bad JSON.
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (bRes) => {
+      let data = '';
+      bRes.on('data', d => { data += d; });
+      bRes.on('end', () => {
+        if (bRes.statusCode < 200 || bRes.statusCode >= 300) {
+          return reject(new Error(`HTTP ${bRes.statusCode}`));
+        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// Binance errors (rate limit, region block) fall back to the equivalent
+// Bybit v5 endpoint, reshaped to match Binance's response so callers
+// (frontend/src/utils/market.ts) don't need to know which exchange answered.
+async function proxyOpenInterestHist(req, res) {
+  const { symbol, period = '1h', limit = '2' } = req.query;
+  try {
+    const data = await fetchJson(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`);
+    return res.json(data);
+  } catch (e) {
+    try {
+      const result = await fetchJson(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=${period}&limit=${limit}`);
+      const list = (result.result?.list || []).slice().reverse();
+      return res.json(list.map(d => ({ symbol, sumOpenInterest: d.openInterest, sumOpenInterestValue: d.openInterest, timestamp: Number(d.timestamp) })));
+    } catch (e2) {
+      return res.status(502).json({ error: `Binance failed (${e.message}), Bybit failed (${e2.message})` });
+    }
+  }
+}
+
+async function proxyLongShortRatio(req, res) {
+  const { symbol, period = '1h', limit = '1' } = req.query;
+  try {
+    const data = await fetchJson(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=${period}&limit=${limit}`);
+    return res.json(data);
+  } catch (e) {
+    try {
+      const result = await fetchJson(`https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=${symbol}&period=${period}&limit=${limit}`);
+      const list = (result.result?.list || []).slice().reverse();
+      return res.json(list.map(d => {
+        const buy = Number(d.buyRatio), sell = Number(d.sellRatio);
+        return { symbol, longShortRatio: sell ? buy / sell : null, longAccount: buy, shortAccount: sell, timestamp: Number(d.timestamp) };
+      }));
+    } catch (e2) {
+      return res.status(502).json({ error: `Binance failed (${e.message}), Bybit failed (${e2.message})` });
+    }
+  }
 }
 
 // --- REST Endpoints ---
 
 // Proxy Binance statistics endpoints (blocked by CORS in browsers)
-app.get('/api/binance/openInterestHist', (req, res) => {
-  const qs = new URLSearchParams(req.query).toString();
-  proxyBinanceFutures(`/futures/data/openInterestHist?${qs}`, res);
-});
+app.get('/api/binance/openInterestHist', proxyOpenInterestHist);
 
-app.get('/api/binance/globalLongShortAccountRatio', (req, res) => {
-  const qs = new URLSearchParams(req.query).toString();
-  proxyBinanceFutures(`/futures/data/globalLongShortAccountRatio?${qs}`, res);
-});
+app.get('/api/binance/globalLongShortAccountRatio', proxyLongShortRatio);
 
 // Health Check
 app.get('/api/health', (req, res) => {
@@ -278,19 +316,77 @@ app.delete('/api/plans/:symbol', async (req, res) => {
 });
 
 
-// --- WebSocket Server Logic (Proximity stream Binance -> Client) ---
+// --- WebSocket Server Logic (Proximity stream Binance -> Client, Bybit fallback) ---
+
+// Binance-style "1h"/"4h"/"1d" -> Bybit-style "60"/"240"/"D"
+function toBybitInterval(interval) {
+  const unit = interval.slice(-1);
+  const num = parseInt(interval.slice(0, -1), 10);
+  if (unit === 'm') return String(num);
+  if (unit === 'h') return String(num * 60);
+  if (unit === 'd') return num === 1 ? 'D' : String(num * 1440);
+  if (unit === 'w') return 'W';
+  return interval;
+}
 
 wss.on('connection', (ws) => {
   let binanceWs = null;
+  let bybitWs = null;
   console.log('Client connected to WebSocket server');
 
-  const closeBinanceWs = () => {
+  const closeUpstream = () => {
     if (binanceWs) {
-      if (binanceWs.readyState === WebSocket.OPEN || binanceWs.readyState === WebSocket.CONNECTING) {
-        binanceWs.close();
-      }
+      if (binanceWs.readyState === WebSocket.OPEN || binanceWs.readyState === WebSocket.CONNECTING) binanceWs.close();
       binanceWs = null;
     }
+    if (bybitWs) {
+      if (bybitWs.readyState === WebSocket.OPEN || bybitWs.readyState === WebSocket.CONNECTING) bybitWs.close();
+      bybitWs = null;
+    }
+  };
+
+  const connectBybit = (symbol, interval) => {
+    console.log(`Falling back to Bybit stream: ${symbol} @ ${interval}`);
+    bybitWs = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+    const bybitInterval = toBybitInterval(interval);
+
+    bybitWs.on('open', () => {
+      bybitWs.send(JSON.stringify({ op: 'subscribe', args: [`kline.${bybitInterval}.${symbol}`] }));
+      console.log(`Bybit stream connected: kline.${bybitInterval}.${symbol}`);
+    });
+
+    bybitWs.on('message', (raw) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try {
+        const parsed = JSON.parse(raw);
+        const k = parsed.data && parsed.data[0];
+        if (k) {
+          const tick = {
+            t: k.start,
+            o: parseFloat(k.open),
+            h: parseFloat(k.high),
+            l: parseFloat(k.low),
+            c: parseFloat(k.close),
+            v: parseFloat(k.volume),
+            closed: k.confirm
+          };
+          ws.send(JSON.stringify(tick));
+        }
+      } catch (err) {
+        console.error(`Error processing Bybit message: ${err.message}`);
+      }
+    });
+
+    bybitWs.on('error', (err) => {
+      console.error(`Bybit websocket error: ${err.message}`);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ error: `Bybit stream error: ${err.message}` }));
+      }
+    });
+
+    bybitWs.on('close', () => {
+      console.log(`Bybit stream closed for ${symbol}`);
+    });
   };
 
   ws.on('message', (message) => {
@@ -300,13 +396,15 @@ wss.on('connection', (ws) => {
       const interval = data.interval || '1h';
 
       console.log(`Subscribing client to Binance stream: ${symbol} @ ${interval}`);
-      closeBinanceWs();
+      closeUpstream();
 
       // Connect to Binance Futures WebSocket stream
       const binanceStreamUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${interval}`;
       binanceWs = new WebSocket(binanceStreamUrl);
+      let binanceConnected = false;
 
       binanceWs.on('open', () => {
+        binanceConnected = true;
         console.log(`Binance stream connected: ${binanceStreamUrl}`);
       });
 
@@ -335,7 +433,11 @@ wss.on('connection', (ws) => {
 
       binanceWs.on('error', (err) => {
         console.error(`Binance websocket error: ${err.message}`);
-        if (ws.readyState === WebSocket.OPEN) {
+        // Only fall back if we never got a working connection — otherwise
+        // a mid-stream drop should just close, not double-stream from Bybit too.
+        if (!binanceConnected) {
+          connectBybit(symbol, interval);
+        } else if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ error: `Binance stream error: ${err.message}` }));
         }
       });
@@ -352,7 +454,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('Client disconnected from WebSocket');
-    closeBinanceWs();
+    closeUpstream();
   });
 });
 

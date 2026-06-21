@@ -1,21 +1,70 @@
 const BINANCE_FAPI = 'https://fapi.binance.com';
+const BYBIT_API = 'https://api.bybit.com';
 const safe = (p: Promise<Response>) => p.then(r => r.json()).catch(() => null);
+
+// Binance-style "1h"/"4h"/"1d" -> Bybit-style "60"/"240"/"D"
+const toBybitInterval = (interval: string) => {
+  const unit = interval.slice(-1);
+  const num = parseInt(interval.slice(0, -1), 10);
+  if (unit === 'm') return String(num);
+  if (unit === 'h') return String(num * 60);
+  if (unit === 'd') return num === 1 ? 'D' : String(num * 1440);
+  if (unit === 'w') return 'W';
+  return interval;
+};
+
+// Fetches the Binance URL; on failure (network error, rate limit, region
+// block — `safe()` swallows the status code so we re-check it here) falls
+// back to the equivalent Bybit call via `bybitFallback`.
+async function withBybitFallback<T>(binanceUrl: string, bybitFallback: () => Promise<T | null>): Promise<T | null> {
+  try {
+    const res = await fetch(binanceUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch {
+    return bybitFallback();
+  }
+}
+
+async function bybitKlines(norm: string, interval: string): Promise<any[] | null> {
+  const data = await safe(fetch(`${BYBIT_API}/v5/market/kline?category=linear&symbol=${norm}&interval=${toBybitInterval(interval)}&limit=200`));
+  const list = data?.result?.list;
+  return Array.isArray(list) ? list.slice().reverse() : null;
+}
+
+async function bybitTicker(norm: string) {
+  const data = await safe(fetch(`${BYBIT_API}/v5/market/tickers?category=linear&symbol=${norm}`));
+  return data?.result?.list?.[0] ?? null;
+}
+
+async function bybitDepth(norm: string) {
+  const data = await safe(fetch(`${BYBIT_API}/v5/market/orderbook?category=linear&symbol=${norm}&limit=50`));
+  return data?.result ? { bids: data.result.b, asks: data.result.a } : null;
+}
 
 export async function fetchMarketSnapshot(symbol: string, apiBase: string) {
   const norm = symbol.replace(/[/\-\s]/g, '').toUpperCase();
 
-  const [k1d, k4h, k1h, funding, oi, oiHist, ls, depth, fng, gecko] = await Promise.all([
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=1d&limit=200`)),
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=4h&limit=200`)),
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=1h&limit=200`)),
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/premiumIndex?symbol=${norm}`)),
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/openInterest?symbol=${norm}`)),
+  const [k1d, k4h, k1h, fundingRaw, oiRaw, oiHist, ls, depth, fng, gecko] = await Promise.all([
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=1d&limit=200`, () => bybitKlines(norm, '1d')),
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=4h&limit=200`, () => bybitKlines(norm, '4h')),
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/klines?symbol=${norm}&interval=1h&limit=200`, () => bybitKlines(norm, '1h')),
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/premiumIndex?symbol=${norm}`, () => bybitTicker(norm)),
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/openInterest?symbol=${norm}`, () => bybitTicker(norm)),
     safe(fetch(`${apiBase}/api/binance/openInterestHist?symbol=${norm}&period=1h&limit=2`)),
     safe(fetch(`${apiBase}/api/binance/globalLongShortAccountRatio?symbol=${norm}&period=1h&limit=1`)),
-    safe(fetch(`${BINANCE_FAPI}/fapi/v1/depth?symbol=${norm}&limit=100`)),
+    withBybitFallback(`${BINANCE_FAPI}/fapi/v1/depth?symbol=${norm}&limit=100`, () => bybitDepth(norm)),
     safe(fetch('https://api.alternative.me/fng/')),
     safe(fetch('https://api.coingecko.com/api/v3/global')),
   ]);
+
+  // Normalize whichever exchange answered into the field names used below.
+  const funding = fundingRaw && 'lastFundingRate' in fundingRaw
+    ? fundingRaw
+    : fundingRaw ? { lastFundingRate: fundingRaw.fundingRate, markPrice: fundingRaw.markPrice } : null;
+  const oi = oiRaw && 'openInterest' in oiRaw && !('fundingRate' in oiRaw)
+    ? oiRaw
+    : oiRaw ? { openInterest: oiRaw.openInterest } : null;
 
   const toOHLCV = (raw: any[][] | null) => (raw ?? []).map((d: any[]) => ({
     timestamp: d[0], open: +d[1], high: +d[2], low: +d[3], close: +d[4], volume: +d[5],

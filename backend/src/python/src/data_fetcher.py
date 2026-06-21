@@ -1,12 +1,20 @@
+import os
+import sys
 import requests
 import pandas as pd
 import time
 from typing import Dict, List, Optional, Tuple
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import bybit_source
+
 class DataFetcher:
     """
     Класифициран модул за извличане на пазарни данни от Binance Futures API,
     както и сентимент и макро индикатори от външни публични API-та.
+
+    При грешка от Binance (rate limit, region block, timeout) автоматично
+    превключва към Bybit за същия символ.
     """
     def __init__(self):
         self.base_url = "https://fapi.binance.com"
@@ -31,25 +39,32 @@ class DataFetcher:
             "interval": interval,
             "limit": limit
         }
-        
-        response = requests.get(endpoint, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Конвертиране в DataFrame
-        df = pd.DataFrame(data, columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "count", "taker_buy_volume",
-            "taker_buy_quote_volume", "ignore"
-        ])
-        
-        # Преобразуване на типовете данни към float
-        float_cols = ["open", "high", "low", "close", "volume"]
-        df[float_cols] = df[float_cols].astype(float)
-        
+
+        try:
+            response = requests.get(endpoint, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            # Конвертиране в DataFrame
+            df = pd.DataFrame(data, columns=[
+                "timestamp", "open", "high", "low", "close", "volume",
+                "close_time", "quote_volume", "count", "taker_buy_volume",
+                "taker_buy_quote_volume", "ignore"
+            ])
+
+            # Преобразуване на типовете данни към float
+            float_cols = ["open", "high", "low", "close", "volume"]
+            df[float_cols] = df[float_cols].astype(float)
+        except Exception:
+            candles = bybit_source.get_klines(norm_symbol, interval, limit, futures=True)
+            df = pd.DataFrame([
+                {"timestamp": c["t"], "open": c["o"], "high": c["h"],
+                 "low": c["l"], "close": c["c"], "volume": c["v"]} for c in candles
+            ])
+
         # Времева марка към дата и час
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-        
+
         return df[["timestamp", "datetime", "open", "high", "low", "close", "volume"]]
 
     def fetch_funding_rate_info(self, symbol: str) -> Dict[str, any]:
@@ -57,29 +72,36 @@ class DataFetcher:
         Извлича текущия Funding Rate и изчислява средната му стойност за последните 10 периода.
         """
         norm_symbol = self.normalize_symbol(symbol)
-        
-        # 1. Текущ Funding Rate
-        endpoint_current = f"{self.base_url}/fapi/v1/premiumIndex"
-        params = {"symbol": norm_symbol}
-        res_current = requests.get(endpoint_current, params=params, timeout=10)
-        res_current.raise_for_status()
-        current_data = res_current.json()
-        
-        current_funding_rate = float(current_data.get("lastFundingRate", 0.0))
-        mark_price = float(current_data.get("markPrice", 0.0))
-        
-        # 2. История за изчисляване на средното (10 периода)
-        endpoint_history = f"{self.base_url}/fapi/v1/fundingRate"
-        params_history = {
-            "symbol": norm_symbol,
-            "limit": 10
-        }
-        res_hist = requests.get(endpoint_history, params_history, timeout=10)
-        res_hist.raise_for_status()
-        hist_data = res_hist.json()
-        
-        rates = [float(x["fundingRate"]) for x in hist_data]
-        avg_funding_rate = sum(rates) / len(rates) if rates else current_funding_rate
+
+        try:
+            # 1. Текущ Funding Rate
+            endpoint_current = f"{self.base_url}/fapi/v1/premiumIndex"
+            params = {"symbol": norm_symbol}
+            res_current = requests.get(endpoint_current, params=params, timeout=10)
+            res_current.raise_for_status()
+            current_data = res_current.json()
+
+            current_funding_rate = float(current_data.get("lastFundingRate", 0.0))
+            mark_price = float(current_data.get("markPrice", 0.0))
+
+            # 2. История за изчисляване на средното (10 периода)
+            endpoint_history = f"{self.base_url}/fapi/v1/fundingRate"
+            params_history = {
+                "symbol": norm_symbol,
+                "limit": 10
+            }
+            res_hist = requests.get(endpoint_history, params_history, timeout=10)
+            res_hist.raise_for_status()
+            hist_data = res_hist.json()
+
+            rates = [float(x["fundingRate"]) for x in hist_data]
+            avg_funding_rate = sum(rates) / len(rates) if rates else current_funding_rate
+        except Exception:
+            # Bybit има само текущия funding rate, не история — средното = текущото.
+            ticker = bybit_source.get_ticker(norm_symbol)
+            current_funding_rate = ticker["funding_rate"]
+            mark_price = ticker["mark_price"]
+            avg_funding_rate = current_funding_rate
         
         # Проверка кой плаща (лонговете или шортовете)
         payer = "Longs pay Shorts" if current_funding_rate > 0 else "Shorts pay Longs"
@@ -100,27 +122,29 @@ class DataFetcher:
         Извлича текущия Open Interest и процентната му промяна (Delta %) за последното денонощие и 1 час.
         """
         norm_symbol = self.normalize_symbol(symbol)
-        
-        # 1. Текущ Open Interest
-        endpoint_current = f"{self.base_url}/fapi/v1/openInterest"
-        res_current = requests.get(endpoint_current, params={"symbol": norm_symbol}, timeout=10)
-        res_current.raise_for_status()
-        current_oi = float(res_current.json().get("openInterest", 0.0))
-        
+
+        try:
+            # 1. Текущ Open Interest
+            endpoint_current = f"{self.base_url}/fapi/v1/openInterest"
+            res_current = requests.get(endpoint_current, params={"symbol": norm_symbol}, timeout=10)
+            res_current.raise_for_status()
+            current_oi = float(res_current.json().get("openInterest", 0.0))
+            binance_ok = True
+        except Exception:
+            current_oi = bybit_source.get_ticker(norm_symbol)["open_interest"]
+            binance_ok = False
+
         # 2. История на Open Interest за 1h период (последните 2 записа)
-        endpoint_hist = f"{self.base_url}/data/openInterestHist"
-        params_hist = {
-            "symbol": norm_symbol,
-            "period": "1h",
-            "limit": 2
-        }
-        
         oi_delta_pct = 0.0
         try:
-            res_hist = requests.get(endpoint_hist, params=params_hist, timeout=10)
-            res_hist.raise_for_status()
-            hist_data = res_hist.json()
-            
+            if binance_ok:
+                endpoint_hist = f"{self.base_url}/data/openInterestHist"
+                res_hist = requests.get(endpoint_hist, params={"symbol": norm_symbol, "period": "1h", "limit": 2}, timeout=10)
+                res_hist.raise_for_status()
+                hist_data = res_hist.json()
+            else:
+                hist_data = bybit_source.get_open_interest_hist(norm_symbol, "1h", 2)
+
             if len(hist_data) >= 2:
                 prev_oi = float(hist_data[0]["sumOpenInterest"])
                 curr_oi_hist = float(hist_data[1]["sumOpenInterest"])
@@ -150,17 +174,21 @@ class DataFetcher:
         ratio = 1.0
         long_pct = 50.0
         short_pct = 50.0
-        
+
         try:
             res = requests.get(endpoint, params=params, timeout=10)
             res.raise_for_status()
             data = res.json()
-            if data:
-                ratio = float(data[0]["longShortRatio"])
-                long_pct = float(data[0]["longAccount"]) * 100
-                short_pct = float(data[0]["shortAccount"]) * 100
         except Exception:
-            pass
+            try:
+                data = bybit_source.get_long_short_ratio(norm_symbol, "1h", 1)
+            except Exception:
+                data = None
+
+        if data:
+            ratio = float(data[0]["longShortRatio"])
+            long_pct = float(data[0]["longAccount"]) * 100
+            short_pct = float(data[0]["shortAccount"]) * 100
 
         signal = "Neutral"
         if ratio > 2.0:
@@ -185,11 +213,14 @@ class DataFetcher:
             "symbol": norm_symbol,
             "limit": 100
         }
-        
-        res = requests.get(endpoint, params=params, timeout=10)
-        res.raise_for_status()
-        depth = res.json()
-        
+
+        try:
+            res = requests.get(endpoint, params=params, timeout=10)
+            res.raise_for_status()
+            depth = res.json()
+        except Exception:
+            depth = bybit_source.get_orderbook(norm_symbol, 100)
+
         bids = depth.get("bids", [])[:50]
         asks = depth.get("asks", [])[:50]
         
