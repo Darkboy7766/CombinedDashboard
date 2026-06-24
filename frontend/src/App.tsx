@@ -10,6 +10,12 @@ import { Navbar } from './components/Navbar';
 import { TradingChart, PlanLevels } from './components/TradingChart';
 import { Sidebar } from './components/Sidebar';
 
+// Caps how much raw OHLCV history the "Export for Claude" clipboard payload
+// carries per timeframe — the computed technical_analysis is unaffected since
+// it comes from its own full 300-candle fetch (see handleExport below).
+const EXPORT_RECENT_CANDLES = 60;
+const recentCandles = <T,>(candles: T[]): T[] => candles.slice(-EXPORT_RECENT_CANDLES);
+
 const App: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => window.innerWidth >= 900);
   const [mobileTab, setMobileTab] = useState(0);
@@ -70,17 +76,21 @@ const App: React.FC = () => {
           macro: snapshot.macro,
         },
         historical_ohlcv_data: {
-          timeframe_1h_candles_count: snapshot.ohlcv_1h.length,
-          timeframe_4h_candles_count: snapshot.ohlcv_4h.length,
-          timeframe_1d_candles_count: snapshot.ohlcv_1d.length,
-          candles_1h: snapshot.ohlcv_1h,
-          candles_4h: snapshot.ohlcv_4h,
-          candles_1d: snapshot.ohlcv_1d,
+          // Only the most recent candles per timeframe — the full EMA/RSI/ATR/S-R
+          // analysis above is computed server-side from a separate 300-candle
+          // fetch, so trimming this raw history doesn't affect it. Keeps the
+          // clipboard payload small enough to paste without truncation.
+          timeframe_1h_candles_count: recentCandles(snapshot.ohlcv_1h).length,
+          timeframe_4h_candles_count: recentCandles(snapshot.ohlcv_4h).length,
+          timeframe_1d_candles_count: recentCandles(snapshot.ohlcv_1d).length,
+          candles_1h: recentCandles(snapshot.ohlcv_1h),
+          candles_4h: recentCandles(snapshot.ohlcv_4h),
+          candles_1d: recentCandles(snapshot.ohlcv_1d),
         },
         technical_analysis: analysis ?? {},
       };
 
-      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      await navigator.clipboard.writeText(JSON.stringify(payload));
       setSnackbarSeverity('success');
       setSnackbarMessage(`Копиран JSON за ${symbol} (${interval})! Поставете го в Claude.`);
     } catch (err: any) {
