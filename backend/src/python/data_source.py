@@ -9,6 +9,7 @@ that is the entire contract.
 Candle dict schema: {t: int (ms), o: float, h: float, l: float, c: float, v: float}
 """
 import json
+import urllib.parse
 import urllib.request
 
 import bybit_source
@@ -25,7 +26,8 @@ _UA = {"User-Agent": "trading-dashboard/1.0"}
 def _binance_klines(symbol: str, interval: str, limit: int = 250, futures: bool = True) -> list[dict]:
     base = BINANCE_FUT if futures else BINANCE_SPOT
     path = "/fapi/v1/klines" if futures else "/api/v3/klines"
-    url  = f"{base}{path}?symbol={symbol}&interval={interval}&limit={limit}"
+    qs   = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": limit})
+    url  = f"{base}{path}?{qs}"
     req  = urllib.request.Request(url, headers=_UA)
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read().decode())

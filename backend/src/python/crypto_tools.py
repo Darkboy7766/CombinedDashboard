@@ -32,9 +32,16 @@ LIVE DATA (needs open network; on region/network block use --csv or mark unavail
   depth      --symbol [--depth 100]
   feargreed  [--days 7]
   dominance
+  liqmap     --symbol [--period 5m --limit 288 --bucket-pct 0.0025 --mm 0.4]  # APPROXIMATION, see note below
   snapshot   --symbol [--interval 4h]            # tries everything; degrades gracefully
+
+liqmap is a modeled estimate of where leveraged liquidations likely cluster
+(delta-OI x assumed leverage distribution x long/short split). Binance never
+reveals real positions, so the output always carries "approximation": true —
+treat it as a secondary confluence signal, never a real S/R level.
 """
-import argparse, csv, json, sys, urllib.request, urllib.error
+import argparse, csv, json, sys, urllib.request, urllib.error, urllib.parse
+from collections import defaultdict
 from datetime import datetime, timezone
 
 SPOT = "https://api.binance.com"
@@ -48,7 +55,10 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def http_get(url, retries=2):
+def http_get(base_url, params=None, retries=2):
+    # params is urlencoded rather than f-string interpolated so values like
+    # "&"/"#"/unicode in symbol/interval can't corrupt the query string.
+    url = f"{base_url}?{urllib.parse.urlencode(params)}" if params else base_url
     last = None
     for _ in range(retries + 1):
         try:
@@ -301,7 +311,7 @@ def cmd_sr(a):
 # ---------- commands: live data ----------
 def _klines_rows(symbol, interval, limit, futures):
     base, path = (FUT, "/fapi/v1/klines") if futures else (SPOT, "/api/v3/klines")
-    data = http_get(f"{base}{path}?symbol={symbol}&interval={interval}&limit={limit}")
+    data = http_get(f"{base}{path}", {"symbol": symbol, "interval": interval, "limit": limit})
     return [{"t": d[0], "o": float(d[1]), "h": float(d[2]), "l": float(d[3]),
              "c": float(d[4]), "v": float(d[5])} for d in data]
 
@@ -315,7 +325,7 @@ def _safe(fn):
 
 def cmd_ticker(a):
     def f():
-        d = http_get(f"{SPOT}/api/v3/ticker/24hr?symbol={a.symbol}")
+        d = http_get(f"{SPOT}/api/v3/ticker/24hr", {"symbol": a.symbol})
         return {"symbol": d["symbol"], "last_price": float(d["lastPrice"]),
                 "price_change_pct": float(d["priceChangePercent"]), "high_24h": float(d["highPrice"]),
                 "low_24h": float(d["lowPrice"]), "volume_24h": float(d["volume"]),
@@ -338,7 +348,7 @@ def cmd_klines(a):
 
 def cmd_funding(a):
     def f():
-        data = http_get(f"{FUT}/fapi/v1/fundingRate?symbol={a.symbol}&limit={a.limit}")
+        data = http_get(f"{FUT}/fapi/v1/fundingRate", {"symbol": a.symbol, "limit": a.limit})
         hist = [{"time": datetime.fromtimestamp(int(d["fundingTime"]) / 1000, tz=timezone.utc).isoformat(),
                  "rate_pct": round(float(d["fundingRate"]) * 100, 6)} for d in data]
         return {"symbol": a.symbol, "current_rate_pct": hist[-1]["rate_pct"] if hist else None,
@@ -349,7 +359,7 @@ def cmd_funding(a):
 
 def cmd_oi(a):
     def f():
-        data = http_get(f"{FUT}/futures/data/openInterestHist?symbol={a.symbol}&period={a.period}&limit={a.limit}")
+        data = http_get(f"{FUT}/futures/data/openInterestHist", {"symbol": a.symbol, "period": a.period, "limit": a.limit})
         hist = [{"time": datetime.fromtimestamp(int(d["timestamp"]) / 1000, tz=timezone.utc).isoformat(),
                  "oi_usd": float(d["sumOpenInterestValue"])} for d in data]
         delta = round((hist[-1]["oi_usd"] / hist[-2]["oi_usd"] - 1) * 100, 2) if len(hist) >= 2 and hist[-2]["oi_usd"] else None
@@ -360,7 +370,7 @@ def cmd_oi(a):
 
 def cmd_longshort(a):
     def f():
-        data = http_get(f"{FUT}/futures/data/globalLongShortAccountRatio?symbol={a.symbol}&period={a.period}&limit={a.limit}")
+        data = http_get(f"{FUT}/futures/data/globalLongShortAccountRatio", {"symbol": a.symbol, "period": a.period, "limit": a.limit})
         d = data[-1]
         return {"symbol": a.symbol, "period": a.period, "current_ratio": float(d["longShortRatio"]),
                 "long_pct": round(float(d["longAccount"]) * 100, 2),
@@ -370,7 +380,7 @@ def cmd_longshort(a):
 
 def cmd_depth(a):
     def f():
-        d = http_get(f"{SPOT}/api/v3/depth?symbol={a.symbol}&limit={a.depth}")
+        d = http_get(f"{SPOT}/api/v3/depth", {"symbol": a.symbol, "limit": a.depth})
         bids = sum(float(p) * float(q) for p, q in d["bids"])
         asks = sum(float(p) * float(q) for p, q in d["asks"])
         return {"symbol": a.symbol, "bid_total_usd": round(bids, 2), "ask_total_usd": round(asks, 2),
@@ -381,11 +391,87 @@ def cmd_depth(a):
 
 def cmd_feargreed(a):
     def f():
-        d = http_get(f"{ALT}/fng/?limit={a.days}")["data"]
+        d = http_get(f"{ALT}/fng/", {"limit": a.days})["data"]
         hist = [{"date": datetime.fromtimestamp(int(x["timestamp"]), tz=timezone.utc).date().isoformat(),
                  "value": int(x["value"]), "classification": x["value_classification"]} for x in d]
         return {"current": hist[0] if hist else None, "history": hist, "fetched_at": now_iso()}
     return _safe(f)
+
+
+# ---------- liquidation cluster estimate (APPROXIMATION — not real positions) ----------
+# Models where leveraged liquidations likely cluster: ΔOI (new positions) x an
+# assumed leverage-tier distribution x long/short split, bucketed around the
+# current price. Binance never reveals real positions — treat this as a
+# secondary confluence signal (stop-hunt / cascade risk), never as a real S/R
+# level, and always surface the "approximation" flag in the plan.
+_LIQMAP_LEVERAGE_DIST = [(5, 0.10), (10, 0.20), (25, 0.30), (50, 0.25), (100, 0.15)]
+
+
+def _liqmap_round_bucket(price, ref_price, bucket_pct):
+    # bucket width is fixed relative to ref_price, NOT to `price` itself —
+    # otherwise price/step is the constant 1/bucket_pct and rounding is a no-op.
+    step = ref_price * bucket_pct
+    return round(price / step) * step if step > 0 else price
+
+
+def _liqmap_liq_price(entry, leverage, side, mmr):
+    imr = 1.0 / leverage
+    return entry * (1 - imr + mmr) if side == "long" else entry * (1 + imr - mmr)
+
+
+def _liqmap(symbol, period, limit, bucket_pct, mmr):
+    oi_hist = http_get(f"{FUT}/futures/data/openInterestHist", {"symbol": symbol, "period": period, "limit": limit})
+    kl = _klines_rows(symbol, period, limit, True)
+    if not kl:
+        return {"error": "no kline data"}
+    try:
+        ls_hist = http_get(f"{FUT}/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": period, "limit": limit})
+        ls_by_ts = {int(x["timestamp"]): float(x["longAccount"]) for x in ls_hist}
+    except Exception:  # noqa
+        ls_by_ts = {}
+
+    price_by_ts = {r["t"]: (r["h"] + r["l"] + r["c"]) / 3.0 for r in kl}
+    ref_price = kl[-1]["c"]
+
+    buckets = defaultdict(lambda: {"total": 0.0, "long": 0.0, "short": 0.0})
+    prev = None
+    for row in oi_hist:
+        ts = int(row["timestamp"])
+        oi_val = float(row["sumOpenInterestValue"])
+        if prev is not None:
+            d = oi_val - prev
+            entry = price_by_ts.get(ts)
+            if d > 0 and entry:  # only growth = new positions opened
+                lf = ls_by_ts.get(ts, 0.5)
+                n_long, n_short = d * lf, d * (1 - lf)
+                for lev, w in _LIQMAP_LEVERAGE_DIST:
+                    b = _liqmap_round_bucket(_liqmap_liq_price(entry, lev, "long", mmr), ref_price, bucket_pct)
+                    buckets[b]["total"] += n_long * w
+                    buckets[b]["long"] += n_long * w
+                    b2 = _liqmap_round_bucket(_liqmap_liq_price(entry, lev, "short", mmr), ref_price, bucket_pct)
+                    buckets[b2]["total"] += n_short * w
+                    buckets[b2]["short"] += n_short * w
+        prev = oi_val
+
+    if not buckets:
+        return {"error": "insufficient OI history to estimate clusters"}
+    mx = max(v["total"] for v in buckets.values())
+    levels = [
+        {"price": round(p, 2), "intensity": round(buckets[p]["total"] / mx, 4),
+         "notional_usd": round(buckets[p]["total"], 2),
+         "long_notional_usd": round(buckets[p]["long"], 2),
+         "short_notional_usd": round(buckets[p]["short"], 2)}
+        for p in sorted(buckets)
+    ]
+    top = sorted(levels, key=lambda x: -x["intensity"])[:8]
+    return {"symbol": symbol, "period": period, "ref_price": ref_price,
+            "approximation": True,
+            "note": "estimated from delta-OI x assumed leverage distribution x long/short split — NOT real exchange positions; secondary confluence only",
+            "top_clusters": top, "levels": levels, "fetched_at": now_iso()}
+
+
+def cmd_liqmap(a):
+    return _safe(lambda: _liqmap(a.symbol, a.period, a.limit, a.bucket_pct, a.mm / 100))
 
 
 def cmd_dominance(a):
@@ -413,7 +499,9 @@ def cmd_snapshot(a):
                     ("funding", lambda: cmd_funding(argparse.Namespace(symbol=a.symbol, limit=5))),
                     ("open_interest", lambda: cmd_oi(argparse.Namespace(symbol=a.symbol, period="4h", limit=10))),
                     ("long_short", lambda: cmd_longshort(argparse.Namespace(symbol=a.symbol, period="4h", limit=5))),
-                    ("sentiment", lambda: cmd_feargreed(argparse.Namespace(days=1)))]:
+                    ("sentiment", lambda: cmd_feargreed(argparse.Namespace(days=1))),
+                    ("liquidation_map", lambda: cmd_liqmap(argparse.Namespace(
+                        symbol=a.symbol, period="5m", limit=288, bucket_pct=0.0025, mm=0.4)))]:
         snap[key] = _safe(fn)
     return snap
 
@@ -442,6 +530,7 @@ def main():
     add("depth", cmd_depth, [("--symbol", dict(required=True)), ("--depth", dict(type=int, default=100))])
     add("feargreed", cmd_feargreed, [("--days", dict(type=int, default=7))])
     add("dominance", cmd_dominance, [])
+    add("liqmap", cmd_liqmap, [("--symbol", dict(required=True)), ("--period", dict(default="5m")), ("--limit", dict(type=int, default=288)), ("--bucket-pct", dict(type=f, default=0.0025, dest="bucket_pct")), ("--mm", dict(type=f, default=0.4))])
     add("snapshot", cmd_snapshot, [("--symbol", dict(default="BTCUSDT")), ("--interval", dict(default="4h"))])
 
     a = p.parse_args()

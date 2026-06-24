@@ -34,10 +34,11 @@ class TradingAgent:
         symbol = data["symbol"]
         formatted_symbol = data["formatted_symbol"]
         
-        # Получаване на последната цена и индикатори от 1h, 4h и 1d
+        # Получаване на последната цена и индикатори от 1h, 4h, 1d и 15m
         df_1h = data["ohlcv_1h"]
         df_4h = data["ohlcv_4h"]
         df_1d = data["ohlcv_1d"]
+        df_15m = data.get("ohlcv_15m", pd.DataFrame())
         
         # Функция за форматиране на индикатори за последната свещ
         def get_candle_info(df):
@@ -53,11 +54,15 @@ class TradingAgent:
             # Намиране на нива
             levels = calc.find_support_resistance_levels(df)
             
+            sma_200_val = last.get("sma_200", 0.0)
             return {
                 "close": last["close"],
                 "ema_20": last.get("ema_20", 0.0),
                 "sma_50": last.get("sma_50", 0.0),
-                "sma_200": last.get("sma_200", 0.0),
+                "sma_200": sma_200_val if pd.notna(sma_200_val) else 0.0,
+                # Wiki convention: SMA/EMA200 is unreliable on <~150-200 candles —
+                # flag it instead of presenting a misleading number to the AI.
+                "sma_200_reliable": len(df) >= 200 and pd.notna(sma_200_val),
                 "rsi": last.get("rsi", 50.0),
                 "bb_upper": last.get("bb_upper", 0.0),
                 "bb_lower": last.get("bb_lower", 0.0),
@@ -66,10 +71,51 @@ class TradingAgent:
                 "resistances": levels["resistances"]
             }
             
+        # 15m се ползва само като GATE за тайминг на входа (MACD кросоувър,
+        # RSI, обем спрямо 20-периодна средна) — НИКОГА за посоката, която
+        # идва от 1D/4H bias-а (виж конвенцията за Gates в trading-plan-conventions).
+        def get_gate_info(df):
+            if df.empty or len(df) < 35:
+                return None
+
+            from src.indicators import IndicatorsCalculator
+            calc = IndicatorsCalculator()
+            processed = calc.process_dataframe(df)
+            last = processed.iloc[-1]
+            prev = processed.iloc[-2]
+
+            vol_avg_20 = processed["volume"].rolling(20).mean().iloc[-1] if "volume" in processed else None
+            vol_last = last.get("volume", None)
+
+            return {
+                "close": last["close"],
+                "rsi": last.get("rsi", 50.0),
+                "macd_hist": last.get("macd_hist", 0.0),
+                "macd_bullish_cross": bool(prev["macd_hist"] <= 0 and last["macd_hist"] > 0),
+                "macd_bearish_cross": bool(prev["macd_hist"] >= 0 and last["macd_hist"] < 0),
+                "volume_last": vol_last,
+                "volume_avg_20": vol_avg_20,
+                "volume_ratio": round(vol_last / vol_avg_20, 2) if vol_avg_20 else None,
+            }
+
         info_1h = get_candle_info(df_1h)
         info_4h = get_candle_info(df_4h)
         info_1d = get_candle_info(df_1d)
-        
+        info_15m = get_gate_info(df_15m)
+
+        sma200_note = "" if (isinstance(info_1d, dict) and info_1d.get("sma_200_reliable")) \
+            else f" ⚠️ НЕНАДЕЖДНА (само {len(df_1d)} дневни свещи, нужни 200+) — игнорирай при анализа"
+
+        if info_15m:
+            gate_section = f"""4. Времева рамка: 15 МИНУТИ (15m) — GATE ЗА ТАЙМИНГ, НЕ ЗА ПОСОКА
+   - Цена: {info_15m['close']:.4f}
+   - RSI (14): {info_15m['rsi']:.2f}
+   - MACD Histogram: {info_15m['macd_hist']:.6f} | Bullish cross: {info_15m['macd_bullish_cross']} | Bearish cross: {info_15m['macd_bearish_cross']}
+   - Обем (последна свещ спрямо 20-периодна средна): {('x' + str(info_15m['volume_ratio'])) if info_15m['volume_ratio'] is not None else 'няма данни'}
+"""
+        else:
+            gate_section = "4. Времева рамка: 15 МИНУТИ (15m) — Няма достатъчно данни за gate проверка.\n"
+
         # Съставяне на текстовия промпт
         prompt = f"""Вие сте елитен институционален крипто трейдър и риск мениджър.
 Вашата цел е да направите детайлен технически и пазарен анализ за деривативния актив {formatted_symbol} (Binance Futures) и да съставите професионален трейдинг план за следващите дни.
@@ -100,13 +146,14 @@ class TradingAgent:
 
 3. Времева рамка: 1 ДЕН (1d)
    - Цена: {info_1d['close']:.4f}
-   - EMA 20: {info_1d['ema_20']:.4f} | SMA 50: {info_1d['sma_50']:.4f} | SMA 200: {info_1d['sma_200']:.4f}
+   - EMA 20: {info_1d['ema_20']:.4f} | SMA 50: {info_1d['sma_50']:.4f} | SMA 200: {info_1d['sma_200']:.4f}{sma200_note}
    - RSI (14): {info_1d['rsi']:.2f}
    - Bollinger Bands: Горна: {info_1d['bb_upper']:.4f} | Долна: {info_1d['bb_lower']:.4f}
    - ATR (14): {info_1d['atr']:.4f}
    - Важни подкрепи: {", ".join([f"{x:.4f}" for x in info_1d['supports']])}
    - Важни съпротиви: {", ".join([f"{x:.4f}" for x in info_1d['resistances']])}
 
+{gate_section}
 --- ДЕРИВАТИВНИ ПОКАЗАТЕЛИ (BINANCE FUTURES) ---
 - Текущ Funding Rate: {data['funding_rate']['current_funding_rate_pct']:.4f}%
 - Среден Funding Rate (последни 10 периода): {data['funding_rate']['avg_funding_rate_10p_pct']:.4f}%
@@ -145,10 +192,15 @@ class TradingAgent:
 
 **ПРАВИЛО ЗА CONFLUENCE:** Ако по-малко от 3 фактора са ✅ ИЗПЪЛНЕНИ → посоката е задължително **WAIT**. Не генерирай LONG/SHORT план при недостатъчна конфлуенция. Изброй изрично кои фактори НЕ са изпълнени и защо спират сетъпа.
 
+**GATES СИСТЕМА (15-минутен entry timing — ЗАДЪЛЖИТЕЛНО ПРАВИЛО):**
+- HTF (1D/4H) данните по-горе определят bias и entry зоната.
+- 15m данните (секция 4) се ползват САМО за потвърждение на точния момент на влизане (MACD кросоувър, RSI, обем спрямо средната).
+- 15m НИКОГА не отменя 1D/4H bias-а. Ако 15m противоречи на HTF — изчакай по-добър тайминг (WAIT за входа), не сменяй посоката.
+
 5. **Трейдинг Стратегия**:
    - Ясно посочена посока: **LONG**, **SHORT** или **WAIT** (Изчакване).
    - Обосновка на стратегията (защо се избира тази посока).
-   - **Зона за покупка/вход (Entry Zone)**: Минимална и максимална цена за позициониране.
+   - **Зона за покупка/вход (Entry Zone)**: Минимална и максимална цена за позициониране, потвърдена от 15m gate-овете.
    - **Цели за печалба (Take Profits)**: Точно 3 цели.
      - TP1 протокол: след достигане → премести Stop Loss на breakeven.
      - TP2 протокол: след достигане → trailing Stop Loss под последния swing low (long) / над swing high (short).
@@ -219,7 +271,7 @@ class TradingAgent:
         """
         Запазва плана в два формата: JSON и Markdown.
         """
-        norm_symbol = symbol.replace("/", "").replace("-", "").upper()
+        norm_symbol = re.sub(r"[^A-Za-z0-9]", "", symbol).upper()
         
         json_path = os.path.join(self.plans_dir, f"{norm_symbol}_plan.json")
         md_path = os.path.join(self.plans_dir, f"{norm_symbol}_plan.md")

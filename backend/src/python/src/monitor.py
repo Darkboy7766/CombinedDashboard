@@ -33,7 +33,7 @@ class TradingMonitor:
         """
         Зарежда записания JSON план за дадения актив.
         """
-        norm_symbol = symbol.replace("/", "").replace("-", "").upper()
+        norm_symbol = re.sub(r"[^A-Za-z0-9]", "", symbol).upper()
         path = os.path.join(self.plans_dir, f"{norm_symbol}_plan.json")
         
         if not os.path.exists(path):

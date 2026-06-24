@@ -34,7 +34,7 @@ def cmd_snapshot(symbol):
 
     serializable = {}
     for k, v in data.items():
-        if k in ["ohlcv_1d", "ohlcv_4h", "ohlcv_1h"]:
+        if k in ["ohlcv_1d", "ohlcv_4h", "ohlcv_1h", "ohlcv_15m"]:
             records = v.copy()
             if "datetime" in records.columns:
                 records["datetime"] = records["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -61,6 +61,7 @@ def cmd_generate_plan_stdin(symbol, plans_dir="plans"):
     snapshot['ohlcv_1d'] = to_df(snapshot.get('ohlcv_1d', []))
     snapshot['ohlcv_4h'] = to_df(snapshot.get('ohlcv_4h', []))
     snapshot['ohlcv_1h'] = to_df(snapshot.get('ohlcv_1h', []))
+    snapshot['ohlcv_15m'] = to_df(snapshot.get('ohlcv_15m', []))
 
     agent = TradingAgent(plans_dir=plans_dir)
     prompt = agent.generate_prompt_content(snapshot)

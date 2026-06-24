@@ -313,11 +313,14 @@ class DataFetcher:
         """
         norm_symbol = self.normalize_symbol(symbol)
         
-        # 1. Извличане на OHLCV за три времеви рамки
+        # 1. Извличане на OHLCV за четири времеви рамки. 15m се ползва само
+        # като gate за тайминг на входа (CHoCH/BOS, volume, RSI, MACD) — никога
+        # за посоката, която идва от 1D/4H (виж agent.py prompt).
         df_1d = self.fetch_ohlcv(norm_symbol, "1d", limit=200)
         df_4h = self.fetch_ohlcv(norm_symbol, "4h", limit=200)
         df_1h = self.fetch_ohlcv(norm_symbol, "1h", limit=200)
-        
+        df_15m = self.fetch_ohlcv(norm_symbol, "15m", limit=200)
+
         # 2. Деривативни данни
         funding = self.fetch_funding_rate_info(norm_symbol)
         oi = self.fetch_open_interest_info(norm_symbol)
@@ -336,6 +339,7 @@ class DataFetcher:
             "ohlcv_1d": df_1d,
             "ohlcv_4h": df_4h,
             "ohlcv_1h": df_1h,
+            "ohlcv_15m": df_15m,
             "funding_rate": funding,
             "open_interest": oi,
             "long_short_ratio": ls_ratio,

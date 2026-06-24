@@ -132,6 +132,7 @@ def analyse(candles: list[dict], symbol: str = "", interval: str = "") -> dict:
             "above_ema200": above200,
             "full_stack":   le21 is not None and le50 is not None and le200 is not None and
                             (le21 > le50 > le200 or le21 < le50 < le200),
+            "ema200_reliable": len(candles) >= 200,
         },
         "rsi": {
             "value":  round(last_rsi, 2) if last_rsi is not None else None,

@@ -4,13 +4,20 @@ const cors = require('cors');
 const http = require('http');
 const https = require('https');
 const WebSocket = require('ws');
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Whitelist for symbol/interval — used both as subprocess args and as
+// filename fragments under plansDir, so this also blocks path traversal.
+const SYMBOL_RE = /^[A-Z0-9]{2,20}$/;
+const INTERVAL_RE = /^[0-9]{1,3}[mhdwM]$/;
+const isValidSymbol = (s) => typeof s === 'string' && SYMBOL_RE.test(s);
+const isValidInterval = (i) => typeof i === 'string' && INTERVAL_RE.test(i);
 
 app.use(cors());
 app.use(express.json());
@@ -33,20 +40,24 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 // --- Helper to execute python bridge commands ---
+// Uses spawn with an argument array (no shell), so arguments can never be
+// interpreted as shell metacharacters — unlike the previous exec()-based
+// version, which only escaped double quotes and was vulnerable to command
+// injection via the symbol/interval route params.
 function runBridge(command, args = []) {
   return new Promise((resolve, reject) => {
     const pythonScript = path.join(__dirname, 'python', 'bridge.py');
-    const escapedArgs = args.map(arg => `"${arg.toString().replace(/"/g, '\\"')}"`).join(' ');
     const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
-    const cmd = `${pythonBin} "${pythonScript}" ${command} ${escapedArgs}`;
-    
-    exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Python Exec error: ${error.message}`);
-        console.error(`Stderr: ${stderr}`);
-        console.error(`Stdout: ${stdout}`);
-        console.error(`Exit code: ${error.code} | Signal: ${error.signal}`);
-        return reject(new Error(stderr || stdout || error.message));
+    const child = spawn(pythonBin, [pythonScript, command, ...args.map(String)]);
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('close', code => {
+      if (code !== 0) {
+        console.error(`Python Exec error (exit ${code}): ${stderr || stdout}`);
+        return reject(new Error(stderr || stdout || `Exit ${code}`));
       }
       try {
         const json = JSON.parse(stdout.trim());
@@ -67,12 +78,16 @@ function runMonitor(symbol) {
   return new Promise((resolve, reject) => {
     const pythonScript = path.join(__dirname, 'python', 'src', 'monitor.py');
     const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
-    const cmd = `${pythonBin} "${pythonScript}" "${symbol}" --json --plans-dir "${plansDir}"`;
-    
-    exec(cmd, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Monitor Exec error: ${error.message}`);
-        return reject(new Error(stderr || error.message));
+    const child = spawn(pythonBin, [pythonScript, symbol, '--json', '--plans-dir', plansDir]);
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('close', code => {
+      if (code !== 0) {
+        console.error(`Monitor Exec error (exit ${code}): ${stderr || stdout}`);
+        return reject(new Error(stderr || stdout || `Exit ${code}`));
       }
       try {
         const json = JSON.parse(stdout.trim());
@@ -187,6 +202,9 @@ app.get('/api/health', (req, res) => {
 // Fetch Candles and EMAs
 app.get('/api/klines/:symbol/:interval', async (req, res) => {
   const { symbol, interval } = req.params;
+  if (!isValidSymbol(symbol) || !isValidInterval(interval)) {
+    return res.status(400).json({ error: 'Invalid symbol or interval' });
+  }
   const limit = req.query.limit || 250;
   try {
     const data = await runBridge('klines', [symbol, interval, limit]);
@@ -199,6 +217,9 @@ app.get('/api/klines/:symbol/:interval', async (req, res) => {
 // Fetch Technical Analysis — candles come from the browser (Binance blocks server IPs)
 app.post('/api/analysis/:symbol/:interval', async (req, res) => {
   const { symbol, interval } = req.params;
+  if (!isValidSymbol(symbol) || !isValidInterval(interval)) {
+    return res.status(400).json({ error: 'Invalid symbol or interval' });
+  }
   const { candles } = req.body;
   if (!candles?.length) return res.status(400).json({ error: 'candles required' });
   try {
@@ -212,6 +233,7 @@ app.post('/api/analysis/:symbol/:interval', async (req, res) => {
 // Fetch Full Snapshot (Derivative + Sentiment + Macro + Technicals)
 app.get('/api/snapshot/:symbol', async (req, res) => {
   const { symbol } = req.params;
+  if (!isValidSymbol(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
   try {
     const data = await runBridge('snapshot', [symbol]);
     res.json(data);
@@ -224,6 +246,7 @@ app.get('/api/snapshot/:symbol', async (req, res) => {
 app.post('/api/plans/generate', async (req, res) => {
   const { symbol, snapshot } = req.body;
   if (!symbol) return res.status(400).json({ error: 'Symbol is required' });
+  if (!isValidSymbol(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
   if (!snapshot) return res.status(400).json({ error: 'snapshot is required' });
   try {
     const result = await runBridgeWithStdin('generate-plan-stdin', [symbol, plansDir], JSON.stringify(snapshot));
@@ -258,6 +281,7 @@ app.get('/api/plans', async (req, res) => {
 // Get plan markdown report
 app.get('/api/plans/:symbol/markdown', async (req, res) => {
   const { symbol } = req.params;
+  if (!isValidSymbol(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
   try {
     const { data, error } = await supabase
       .from('plans')
@@ -274,6 +298,7 @@ app.get('/api/plans/:symbol/markdown', async (req, res) => {
 // Monitor an active plan — writes temp JSON so monitor.py can read plan config
 app.get('/api/plans/:symbol/monitor', async (req, res) => {
   const { symbol } = req.params;
+  if (!isValidSymbol(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
   const upperSymbol = symbol.toUpperCase();
   try {
     const { data } = await supabase
@@ -297,6 +322,7 @@ app.get('/api/plans/:symbol/monitor', async (req, res) => {
 // Delete an active plan
 app.delete('/api/plans/:symbol', async (req, res) => {
   const { symbol } = req.params;
+  if (!isValidSymbol(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
   const upperSymbol = symbol.toUpperCase();
   try {
     const { error, count } = await supabase
